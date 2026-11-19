@@ -165,6 +165,37 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
     InterlockedExchange(&s_frame_draws, (LONG)draws);
 }
 
+/* Borderless full screen on the window's monitor, and back. F11 or
+ * Alt+Enter; RECOMP_FULLSCREEN=1 starts that way. */
+static void fb_toggle_fullscreen(HWND h)
+{
+    static WINDOWPLACEMENT wp;
+    static int full;
+    LONG style = GetWindowLongA(h, GWL_STYLE);
+
+    if (!full) {
+        MONITORINFO mi;
+        memset(&mi, 0, sizeof mi);
+        mi.cbSize = sizeof mi;
+        wp.length = sizeof wp;
+        if (!GetWindowPlacement(h, &wp) ||
+            !GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
+            return;
+        SetWindowLongA(h, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        full = 1;
+    } else {
+        SetWindowLongA(h, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(h, &wp);
+        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        full = 0;
+    }
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -175,6 +206,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        /* Window keys, kept away from the pad: Enter is Start. */
+        if (w == VK_F11 || (w == VK_RETURN && m == WM_SYSKEYDOWN && (l & (1 << 29)))) {
+            if (!(l & (1 << 30)))       /* not auto-repeat */
+                fb_toggle_fullscreen(h);
+            return 0;
+        }
         xbox_InputKeySet((int)w, 1);
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
          *
@@ -305,6 +342,36 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+/* GDI path: s_rgb scaled into the client area, 4:3 with black bars. Nothing
+ * when the D3D11 back end presents to this window itself. */
+static void fb_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+{
+    RECT cr;
+    int w, h, dw, dh, x, y;
+
+    if (GetPropA(hwnd, "XboxRecompGpuPresent") || !GetClientRect(hwnd, &cr))
+        return;
+    w = cr.right - cr.left;
+    h = cr.bottom - cr.top;
+    if (w <= 0 || h <= 0)
+        return;
+    dw = w;
+    dh = h;
+    if (dw * 3 > dh * 4) dw = dh * 4 / 3; else dh = dw * 3 / 4;
+    x = (w - dw) / 2;
+    y = (h - dh) / 2;
+    if (x > 0) {
+        PatBlt(hdc, 0, 0, x, h, BLACKNESS);
+        PatBlt(hdc, x + dw, 0, w - x - dw, h, BLACKNESS);
+    }
+    if (y > 0) {
+        PatBlt(hdc, 0, 0, w, y, BLACKNESS);
+        PatBlt(hdc, 0, y + dh, w, h - y - dh, BLACKNESS);
+    }
+    StretchDIBits(hdc, x, y, dw, dh, 0, 0, (int)s_fb_width, (int)s_fb_height,
+                  s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -323,8 +390,30 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
-    r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
-    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    {
+        /* Open at the largest whole multiple of 640x480 (up to
+         * RECOMP_WINDOW_SCALE, default 2) that fits the work area; the window
+         * can be resized freely and the picture follows, 4:3. */
+        RECT wa;
+        const char *e = getenv("RECOMP_WINDOW_SCALE");
+        int scale = e ? atoi(e) : 2;
+        if (scale < 1) scale = 1;
+        if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0))
+            SetRect(&wa, 0, 0, 1024, 768);
+        for (; scale > 1; scale--) {
+            r.left = 0; r.top = 0;
+            r.right = (LONG)s_fb_width * scale;
+            r.bottom = (LONG)s_fb_height * scale;
+            AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+            if (r.right - r.left <= wa.right - wa.left &&
+                r.bottom - r.top <= wa.bottom - wa.top)
+                break;
+        }
+        r.left = 0; r.top = 0;
+        r.right = (LONG)s_fb_width * scale;
+        r.bottom = (LONG)s_fb_height * scale;
+        AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    }
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
@@ -335,6 +424,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         return 0;
     }
     hdc = GetDC(hwnd);
+    SetStretchBltMode(hdc, HALFTONE);
+    SetBrushOrgEx(hdc, 0, 0, NULL);
+    if (getenv("RECOMP_FULLSCREEN") && atoi(getenv("RECOMP_FULLSCREEN")))
+        fb_toggle_fullscreen(hwnd);
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -363,18 +456,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            fb_blit(hwnd, hdc, &bi);
         } else if (s_fb_va && s_fb_pitch && s_rgb) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            fb_blit(hwnd, hdc, &bi);
         }
         {
             /* One dump a few seconds in, so the title has had time to render

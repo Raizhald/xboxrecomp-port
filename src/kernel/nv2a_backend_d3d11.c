@@ -46,6 +46,7 @@
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
+#include <dxgi1_2.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,7 @@
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dxguid.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "user32.lib")
 
 /* ---- Shaders ----------------------------------------------------------- */
 
@@ -1324,6 +1326,264 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     g_time_end(&t0);
 }
 
+/* ---- Direct present ---------------------------------------------------- */
+/* With a game window open (RECOMP_FB_WINDOW), the flipped buffer goes straight
+ * from its render target to a DXGI swap chain on that window, scaled to the
+ * window with the 4:3 picture kept (an anti-aliased 2x surface is averaged by
+ * the linear filter). The window thread stops drawing through GDI once the
+ * window carries the "XboxRecompGpuPresent" property. The window is found by
+ * class, so the back end needs nothing linked from src/video.
+ *   RECOMP_GPU_PRESENT=0   keep the GDI window (old behaviour)
+ *   RECOMP_VSYNC=0         present without waiting for vblank (default 1)
+ *   RECOMP_GPU_READBACK=0  skip copying the frame back to guest memory while
+ *                          presenting directly (no latest.bmp / shots then) */
+static const char k_present_hlsl[] =
+    "Texture2D t : register(t0); SamplerState s : register(s0);\n"
+    "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "V VSBlit(uint id : SV_VertexID) {\n"
+    "  V o; float2 uv = float2((id << 1) & 2, id & 2);\n"
+    "  o.uv = uv; o.p = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);\n"
+    "  return o; }\n"
+    "float4 PSBlit(V i) : SV_Target { return float4(t.Sample(s, i.uv).rgb, 1); }\n";
+
+static struct {
+    int tried, ok, vsync, readback, searches, announced;
+    HWND hwnd;
+    IDXGISwapChain1 *sc;
+    ID3D11RenderTargetView *rtv;
+    UINT w, h;
+    ID3D11VertexShader *vs;
+    ID3D11PixelShader *ps;
+    ID3D11SamplerState *smp;
+    ID3D11RasterizerState *rs;
+    ID3D11BlendState *bs;
+    ID3D11DepthStencilState *dss;
+} P;
+
+static int p_compile(const char *entry, const char *profile, ID3DBlob **out)
+{
+    ID3DBlob *err = NULL;
+    HRESULT hr = D3DCompile(k_present_hlsl, sizeof k_present_hlsl - 1,
+                            "nv2a_present", NULL, NULL, entry, profile,
+                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out, &err);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[GPUB] present shader %s does not compile: %s\n", entry,
+                err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "");
+        fflush(stderr);
+    }
+    REL(err);
+    return SUCCEEDED(hr);
+}
+
+static int p_init(void)
+{
+    const char *e = getenv("RECOMP_GPU_PRESENT");
+    ID3DBlob *vb = NULL, *pb = NULL;
+    D3D11_SAMPLER_DESC sd;
+    D3D11_RASTERIZER_DESC rd;
+    D3D11_BLEND_DESC bd;
+    D3D11_DEPTH_STENCIL_DESC dd;
+    int ok;
+
+    if (e && atoi(e) == 0)
+        return 0;
+    e = getenv("RECOMP_VSYNC");
+    P.vsync = e ? atoi(e) : 1;
+    e = getenv("RECOMP_GPU_READBACK");
+    P.readback = e ? atoi(e) : 1;
+    if (!p_compile("VSBlit", "vs_5_0", &vb) || !p_compile("PSBlit", "ps_5_0", &pb)) {
+        REL(vb);
+        REL(pb);
+        return 0;
+    }
+    ok = SUCCEEDED(ID3D11Device_CreateVertexShader(G.dev, ID3D10Blob_GetBufferPointer(vb),
+                       ID3D10Blob_GetBufferSize(vb), NULL, &P.vs)) &&
+         SUCCEEDED(ID3D11Device_CreatePixelShader(G.dev, ID3D10Blob_GetBufferPointer(pb),
+                       ID3D10Blob_GetBufferSize(pb), NULL, &P.ps));
+    REL(vb);
+    REL(pb);
+    memset(&sd, 0, sizeof sd);
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    memset(&rd, 0, sizeof rd);
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    memset(&bd, 0, sizeof bd);
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    memset(&dd, 0, sizeof dd);
+    dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    ok = ok && SUCCEEDED(ID3D11Device_CreateSamplerState(G.dev, &sd, &P.smp))
+            && SUCCEEDED(ID3D11Device_CreateRasterizerState(G.dev, &rd, &P.rs))
+            && SUCCEEDED(ID3D11Device_CreateBlendState(G.dev, &bd, &P.bs))
+            && SUCCEEDED(ID3D11Device_CreateDepthStencilState(G.dev, &dd, &P.dss));
+    if (!ok) {
+        fprintf(stderr, "[GPUB] direct present unavailable (pipeline setup)\n");
+        fflush(stderr);
+    }
+    return ok;
+}
+
+static void p_drop_swapchain(void)
+{
+    if (G.ctx)
+        ID3D11DeviceContext_OMSetRenderTargets(G.ctx, 0, NULL, NULL);
+    REL(P.rtv);
+    REL(P.sc);
+    P.w = P.h = 0;
+}
+
+/* The game window of this process, if one is open. */
+static HWND p_window(void)
+{
+    HWND h = NULL;
+
+    if (P.hwnd && IsWindow(P.hwnd))
+        return P.hwnd;
+    if (P.hwnd) {                       /* closed: let go of its swap chain */
+        p_drop_swapchain();
+        P.hwnd = NULL;
+    }
+    if (P.searches++ % 60)              /* look about once a second */
+        return NULL;
+    while ((h = FindWindowExA(NULL, h, "XboxRecompFramebuffer", NULL)) != NULL) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (pid == GetCurrentProcessId())
+            return P.hwnd = h;
+    }
+    return NULL;
+}
+
+static int p_swapchain(HWND hwnd, UINT w, UINT h)
+{
+    IDXGIDevice *xd = NULL;
+    IDXGIAdapter *ad = NULL;
+    IDXGIFactory2 *f = NULL;
+    DXGI_SWAP_CHAIN_DESC1 d;
+    HRESULT hr = E_FAIL;
+
+    if (SUCCEEDED(ID3D11Device_QueryInterface(G.dev, &IID_IDXGIDevice, (void **)&xd)) &&
+        SUCCEEDED(IDXGIDevice_GetAdapter(xd, &ad)) &&
+        SUCCEEDED(IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory2, (void **)&f))) {
+        memset(&d, 0, sizeof d);
+        d.Width = w;
+        d.Height = h;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        d.BufferCount = 2;
+        d.Scaling = DXGI_SCALING_STRETCH;
+        d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        hr = IDXGIFactory2_CreateSwapChainForHwnd(f, (IUnknown *)G.dev, hwnd, &d,
+                                                  NULL, NULL, &P.sc);
+        if (SUCCEEDED(hr))              /* the window handles Alt+Enter itself */
+            IDXGIFactory2_MakeWindowAssociation(f, hwnd, DXGI_MWA_NO_ALT_ENTER);
+    }
+    REL(f);
+    REL(ad);
+    REL(xd);
+    if (FAILED(hr))
+        g_log_hr("CreateSwapChainForHwnd", hr);
+    return SUCCEEDED(hr);
+}
+
+static void g_present(GRt *rt)
+{
+    static ID3D11ShaderResourceView *const none[1] = { NULL };
+    HWND hwnd;
+    RECT cr;
+    UINT w, h;
+    D3D11_VIEWPORT vp;
+    float aw, ah;
+    HRESULT hr;
+    static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+    if (!P.tried) {
+        P.tried = 1;
+        P.ok = p_init();
+    }
+    if (!P.ok || !rt->srv || !(hwnd = p_window()))
+        return;
+    if (!GetClientRect(hwnd, &cr))
+        return;
+    w = (UINT)(cr.right - cr.left);
+    h = (UINT)(cr.bottom - cr.top);
+    if (!w || !h)
+        return;                         /* minimised */
+    if (!P.sc) {
+        if (!p_swapchain(hwnd, w, h)) {
+            P.ok = 0;                   /* the GDI window carries on */
+            return;
+        }
+        P.w = w;
+        P.h = h;
+        SetPropA(hwnd, "XboxRecompGpuPresent", (HANDLE)1);
+        if (!P.announced++) {
+            fprintf(stderr, "[GPUB] presenting directly to the window (vsync %d,"
+                            " readback %d)\n", P.vsync, P.readback);
+            fflush(stderr);
+        }
+    } else if (w != P.w || h != P.h) {
+        ID3D11DeviceContext_OMSetRenderTargets(G.ctx, 0, NULL, NULL);
+        REL(P.rtv);
+        hr = IDXGISwapChain1_ResizeBuffers(P.sc, 0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+        if (FAILED(hr)) {
+            g_log_hr("ResizeBuffers", hr);
+            return;
+        }
+        P.w = w;
+        P.h = h;
+    }
+    if (!P.rtv) {
+        ID3D11Texture2D *bb = NULL;
+        if (FAILED(IDXGISwapChain1_GetBuffer(P.sc, 0, &IID_ID3D11Texture2D, (void **)&bb)))
+            return;
+        hr = ID3D11Device_CreateRenderTargetView(G.dev, (ID3D11Resource *)bb, NULL, &P.rtv);
+        REL(bb);
+        if (FAILED(hr))
+            return;
+    }
+    /* 4:3, centred, black bars. */
+    aw = (float)w;
+    ah = (float)h;
+    if (aw * 3.0f > ah * 4.0f)
+        aw = ah * 4.0f / 3.0f;
+    else
+        ah = aw * 3.0f / 4.0f;
+    vp.TopLeftX = ((float)w - aw) * 0.5f;
+    vp.TopLeftY = ((float)h - ah) * 0.5f;
+    vp.Width = aw;
+    vp.Height = ah;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_ClearRenderTargetView(G.ctx, P.rtv, black);
+    ID3D11DeviceContext_OMSetRenderTargets(G.ctx, 1, &P.rtv, NULL);
+    ID3D11DeviceContext_RSSetViewports(G.ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(G.ctx, P.rs);
+    ID3D11DeviceContext_OMSetBlendState(G.ctx, P.bs, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(G.ctx, P.dss, 0);
+    ID3D11DeviceContext_IASetInputLayout(G.ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(G.ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(G.ctx, P.vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(G.ctx, P.ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 1, &rt->srv);
+    ID3D11DeviceContext_PSSetSamplers(G.ctx, 0, 1, &P.smp);
+    ID3D11DeviceContext_Draw(G.ctx, 3, 0);
+    /* Every batch rebinds its whole pipeline, so only the hazards matter. */
+    ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 1, none);
+    ID3D11DeviceContext_OMSetRenderTargets(G.ctx, 0, NULL, NULL);
+    hr = IDXGISwapChain1_Present(P.sc, P.vsync ? 1u : 0u, 0);
+    if (FAILED(hr)) {
+        static int logged;
+        if (!logged++)
+            g_log_hr("Present", hr);
+    }
+}
+
 static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
 {
     LARGE_INTEGER t0;
@@ -1335,6 +1595,12 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
     if (!rt || !pitch || (bpp != 2 && bpp != 4))
         return;
     g_time_begin(&t0);
+    g_present(rt);
+    if (P.sc && !P.readback) {
+        G.n_resolves++;
+        g_time_end(&t0);
+        return;
+    }
     w = rt->w;
     h = rt->h;
     if (w * bpp > pitch)
