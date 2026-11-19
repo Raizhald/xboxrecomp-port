@@ -310,6 +310,15 @@ static struct {
     uint32_t copy_w, copy_h;
     ID3D11Texture2D *staging;
     uint32_t staging_w, staging_h;
+    /* RECOMP_GPU_SCALE: render targets and depth buffers are this many times
+     * the guest size in each direction. Everything the guest sees (vertex
+     * positions, texel scales, sizes in logs, read-back) stays in guest
+     * pixels; only the textures, viewports, scissors and clear rectangles
+     * grow. Read-back goes through a 1x copy (down_*). */
+    uint32_t scale;
+    ID3D11Texture2D *down_tex;
+    ID3D11RenderTargetView *down_rtv;
+    uint32_t down_w, down_h;
     struct { uint32_t key; ID3D11SamplerState *s; } samp[64];
     struct { uint32_t key[3]; ID3D11BlendState *s; } blend[64];
     struct { uint32_t key; ID3D11DepthStencilState *s; } dss[32];
@@ -321,6 +330,10 @@ static struct {
     uint32_t n_draws, n_clears, n_uploads, n_selfcopy, n_resolves, n_rt_dropped;
     uint64_t n_verts, n_hashed, n_upload_bytes;
 } G;
+
+static int g_blit_init(void);
+static void g_blit(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst,
+                   float x, float y, float w, float h, int linear);
 
 static void g_log_hr(const char *what, HRESULT hr)
 {
@@ -497,6 +510,14 @@ static int g_init(void)
     G.check_every_bind = e && strcmp(e, "batch") == 0;
     e = getenv("RECOMP_GPU_TRACE");
     G.trace_frame = e ? (uint32_t)atoi(e) : 0;
+    e = getenv("RECOMP_GPU_SCALE");
+    G.scale = e ? (uint32_t)atoi(e) : 1;
+    if (G.scale < 1) G.scale = 1;
+    if (G.scale > 4) G.scale = 4;
+    if (G.scale > 1) {
+        fprintf(stderr, "[GPUB] rendering at %ux the guest resolution\n", G.scale);
+        fflush(stderr);
+    }
     fprintf(stderr, "[GPUB] Direct3D 11 device, feature level %x.%x%s\n",
             (unsigned)got >> 12, ((unsigned)got >> 8) & 0xF,
             G.ctx1 ? "" : " (no ClearView: colour clears ignore the clip rect)");
@@ -554,23 +575,44 @@ static int g_rt_create(GRt *r, uint32_t va, uint32_t w, uint32_t h,
         init = &sd;
     }
     memset(&td, 0, sizeof td);
-    td.Width = w;
-    td.Height = h;
+    td.Width = w * G.scale;
+    td.Height = h * G.scale;
     td.MipLevels = td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    hr = ID3D11Device_CreateTexture2D(G.dev, &td, init, &r->tex);
-    free(px);
-    if (FAILED(hr)) { g_log_hr("CreateTexture2D(rt)", hr); return 0; }
+    hr = ID3D11Device_CreateTexture2D(G.dev, &td, G.scale == 1 ? init : NULL, &r->tex);
+    if (FAILED(hr)) { g_log_hr("CreateTexture2D(rt)", hr); free(px); return 0; }
     hr = ID3D11Device_CreateRenderTargetView(G.dev, (ID3D11Resource *)r->tex,
                                              NULL, &r->rtv);
     if (FAILED(hr)) { g_log_hr("CreateRenderTargetView", hr); REL(r->tex); return 0; }
     hr = ID3D11Device_CreateShaderResourceView(G.dev, (ID3D11Resource *)r->tex,
                                                NULL, &r->srv);
     if (FAILED(hr)) { g_log_hr("CreateShaderResourceView(rt)", hr);
-                      REL(r->rtv); REL(r->tex); return 0; }
+                      REL(r->rtv); REL(r->tex); free(px); return 0; }
+    if (G.scale > 1) {
+        /* Guest contents at 1x, stretched (nearest) to the scaled target;
+         * otherwise a scaled target starts black. */
+        ID3D11Texture2D *tmp = NULL;
+        ID3D11ShaderResourceView *tsrv = NULL;
+        float clr[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        ID3D11DeviceContext_ClearRenderTargetView(G.ctx, r->rtv, clr);
+        if (init) {
+            td.Width = w;
+            td.Height = h;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (SUCCEEDED(ID3D11Device_CreateTexture2D(G.dev, &td, init, &tmp)) &&
+                SUCCEEDED(ID3D11Device_CreateShaderResourceView(G.dev,
+                              (ID3D11Resource *)tmp, NULL, &tsrv)) &&
+                g_blit_init())
+                g_blit(tsrv, r->rtv, 0.0f, 0.0f, (float)(w * G.scale),
+                       (float)(h * G.scale), 0);
+            REL(tsrv);
+            REL(tmp);
+        }
+    }
+    free(px);
     r->va = va; r->w = w; r->h = h; r->bpp = bpp; r->pitch = pitch;
     r->last_frame = G.frame;
     r->guest_fp = g_rt_fp(r);
@@ -624,8 +666,8 @@ static GRt *g_rt_get(const Nv2aSurface *s)
         if (r->bpp == bpp) {
             D3D11_BOX box;
             box.left = 0; box.top = 0; box.front = 0;
-            box.right = r->w < w ? r->w : w;
-            box.bottom = r->h < h ? r->h : h;
+            box.right = (r->w < w ? r->w : w) * G.scale;
+            box.bottom = (r->h < h ? r->h : h) * G.scale;
             box.back = 1;
             ID3D11DeviceContext_CopySubresourceRegion(G.ctx, (ID3D11Resource *)n.tex,
                                                       0, 0, 0, 0,
@@ -675,8 +717,8 @@ static GDepth *g_depth_get(uint32_t va, uint32_t w, uint32_t h, int *fresh)
         REL(G.depth[i].tex);
     }
     memset(&td, 0, sizeof td);
-    td.Width = w;
-    td.Height = h;
+    td.Width = w * G.scale;
+    td.Height = h * G.scale;
     td.MipLevels = td.ArraySize = 1;
     td.Format = DXGI_FORMAT_D32_FLOAT;
     td.SampleDesc.Count = 1;
@@ -1020,13 +1062,13 @@ static void g_bind_target(GRt *rt, ID3D11DepthStencilView *dsv,
     ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 4, none);
     ID3D11DeviceContext_OMSetRenderTargets(G.ctx, 1, &rt->rtv, dsv);
     vp.TopLeftX = 0.0f; vp.TopLeftY = 0.0f;
-    vp.Width = (float)rt->w; vp.Height = (float)rt->h;
+    vp.Width = (float)(rt->w * G.scale); vp.Height = (float)(rt->h * G.scale);
     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_RSSetViewports(G.ctx, 1, &vp);
-    sc.left = (LONG)s->clip_x;
-    sc.top = (LONG)s->clip_y;
-    sc.right = (LONG)(s->clip_x + s->width);
-    sc.bottom = (LONG)(s->clip_y + s->height);
+    sc.left = (LONG)(s->clip_x * G.scale);
+    sc.top = (LONG)(s->clip_y * G.scale);
+    sc.right = (LONG)((s->clip_x + s->width) * G.scale);
+    sc.bottom = (LONG)((s->clip_y + s->height) * G.scale);
     ID3D11DeviceContext_RSSetScissorRects(G.ctx, 1, &sc);
 }
 
@@ -1059,10 +1101,10 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
         }
         if (G.ctx1) {
             D3D11_RECT r;
-            r.left = (LONG)s->clip_x;
-            r.top = (LONG)s->clip_y;
-            r.right = (LONG)(s->clip_x + s->width);
-            r.bottom = (LONG)(s->clip_y + s->height);
+            r.left = (LONG)(s->clip_x * G.scale);
+            r.top = (LONG)(s->clip_y * G.scale);
+            r.right = (LONG)((s->clip_x + s->width) * G.scale);
+            r.bottom = (LONG)((s->clip_y + s->height) * G.scale);
             ID3D11DeviceContext1_ClearView(G.ctx1, (ID3D11View *)rt->rtv, c, &r, 1);
         } else {
             ID3D11DeviceContext_ClearRenderTargetView(G.ctx, rt->rtv, c);
@@ -1090,8 +1132,8 @@ static ID3D11ShaderResourceView *g_self_copy(GRt *rt)
         REL(G.copy_srv);
         REL(G.copy_tex);
         memset(&td, 0, sizeof td);
-        td.Width = rt->w;
-        td.Height = rt->h;
+        td.Width = rt->w * G.scale;
+        td.Height = rt->h * G.scale;
         td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
@@ -1354,7 +1396,7 @@ static struct {
     UINT w, h;
     ID3D11VertexShader *vs;
     ID3D11PixelShader *ps;
-    ID3D11SamplerState *smp;
+    ID3D11SamplerState *smp, *smp_pt;
     ID3D11RasterizerState *rs;
     ID3D11BlendState *bs;
     ID3D11DepthStencilState *dss;
@@ -1375,22 +1417,19 @@ static int p_compile(const char *entry, const char *profile, ID3DBlob **out)
     return SUCCEEDED(hr);
 }
 
-static int p_init(void)
+/* The blit pipeline (present, up- and down-scaling), made once on first use. */
+static int g_blit_init(void)
 {
-    const char *e = getenv("RECOMP_GPU_PRESENT");
+    static int tried, ok;
     ID3DBlob *vb = NULL, *pb = NULL;
     D3D11_SAMPLER_DESC sd;
     D3D11_RASTERIZER_DESC rd;
     D3D11_BLEND_DESC bd;
     D3D11_DEPTH_STENCIL_DESC dd;
-    int ok;
 
-    if (e && atoi(e) == 0)
-        return 0;
-    e = getenv("RECOMP_VSYNC");
-    P.vsync = e ? atoi(e) : 1;
-    e = getenv("RECOMP_GPU_READBACK");
-    P.readback = e ? atoi(e) : 1;
+    if (tried)
+        return ok;
+    tried = 1;
     if (!p_compile("VSBlit", "vs_5_0", &vb) || !p_compile("PSBlit", "ps_5_0", &pb)) {
         REL(vb);
         REL(pb);
@@ -1415,15 +1454,59 @@ static int p_init(void)
     memset(&dd, 0, sizeof dd);
     dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
     dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
-    ok = ok && SUCCEEDED(ID3D11Device_CreateSamplerState(G.dev, &sd, &P.smp))
+    ok = ok && SUCCEEDED(ID3D11Device_CreateSamplerState(G.dev, &sd, &P.smp));
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    ok = ok && SUCCEEDED(ID3D11Device_CreateSamplerState(G.dev, &sd, &P.smp_pt))
             && SUCCEEDED(ID3D11Device_CreateRasterizerState(G.dev, &rd, &P.rs))
             && SUCCEEDED(ID3D11Device_CreateBlendState(G.dev, &bd, &P.bs))
             && SUCCEEDED(ID3D11Device_CreateDepthStencilState(G.dev, &dd, &P.dss));
     if (!ok) {
-        fprintf(stderr, "[GPUB] direct present unavailable (pipeline setup)\n");
+        fprintf(stderr, "[GPUB] blit pipeline unavailable\n");
         fflush(stderr);
     }
     return ok;
+}
+
+static void g_blit(ID3D11ShaderResourceView *src, ID3D11RenderTargetView *dst,
+                   float x, float y, float w, float h, int linear)
+{
+    static ID3D11ShaderResourceView *const none[1] = { NULL };
+    D3D11_VIEWPORT vp;
+
+    vp.TopLeftX = x;
+    vp.TopLeftY = y;
+    vp.Width = w;
+    vp.Height = h;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_OMSetRenderTargets(G.ctx, 1, &dst, NULL);
+    ID3D11DeviceContext_RSSetViewports(G.ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(G.ctx, P.rs);
+    ID3D11DeviceContext_OMSetBlendState(G.ctx, P.bs, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(G.ctx, P.dss, 0);
+    ID3D11DeviceContext_IASetInputLayout(G.ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(G.ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(G.ctx, P.vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(G.ctx, P.ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 1, &src);
+    ID3D11DeviceContext_PSSetSamplers(G.ctx, 0, 1, linear ? &P.smp : &P.smp_pt);
+    ID3D11DeviceContext_Draw(G.ctx, 3, 0);
+    /* Every batch rebinds its whole pipeline, so only the hazards matter. */
+    ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 1, none);
+    ID3D11DeviceContext_OMSetRenderTargets(G.ctx, 0, NULL, NULL);
+}
+
+static int p_init(void)
+{
+    const char *e = getenv("RECOMP_GPU_PRESENT");
+
+    if (e && atoi(e) == 0)
+        return 0;
+    e = getenv("RECOMP_VSYNC");
+    P.vsync = e ? atoi(e) : 1;
+    e = getenv("RECOMP_GPU_READBACK");
+    P.readback = e ? atoi(e) : 1;
+    return g_blit_init();
 }
 
 static void p_drop_swapchain(void)
@@ -1493,7 +1576,6 @@ static int p_swapchain(HWND hwnd, UINT w, UINT h)
 
 static void g_present(GRt *rt)
 {
-    static ID3D11ShaderResourceView *const none[1] = { NULL };
     HWND hwnd;
     RECT cr;
     UINT w, h;
@@ -1561,21 +1643,7 @@ static void g_present(GRt *rt)
     vp.MinDepth = 0.0f;
     vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_ClearRenderTargetView(G.ctx, P.rtv, black);
-    ID3D11DeviceContext_OMSetRenderTargets(G.ctx, 1, &P.rtv, NULL);
-    ID3D11DeviceContext_RSSetViewports(G.ctx, 1, &vp);
-    ID3D11DeviceContext_RSSetState(G.ctx, P.rs);
-    ID3D11DeviceContext_OMSetBlendState(G.ctx, P.bs, NULL, 0xFFFFFFFFu);
-    ID3D11DeviceContext_OMSetDepthStencilState(G.ctx, P.dss, 0);
-    ID3D11DeviceContext_IASetInputLayout(G.ctx, NULL);
-    ID3D11DeviceContext_IASetPrimitiveTopology(G.ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_VSSetShader(G.ctx, P.vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(G.ctx, P.ps, NULL, 0);
-    ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 1, &rt->srv);
-    ID3D11DeviceContext_PSSetSamplers(G.ctx, 0, 1, &P.smp);
-    ID3D11DeviceContext_Draw(G.ctx, 3, 0);
-    /* Every batch rebinds its whole pipeline, so only the hazards matter. */
-    ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 1, none);
-    ID3D11DeviceContext_OMSetRenderTargets(G.ctx, 0, NULL, NULL);
+    g_blit(rt->srv, P.rtv, vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, 1);
     hr = IDXGISwapChain1_Present(P.sc, P.vsync ? 1u : 0u, 0);
     if (FAILED(hr)) {
         static int logged;
@@ -1627,8 +1695,40 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
         G.staging_w = rt->w;
         G.staging_h = rt->h;
     }
-    ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)G.staging,
-                                     (ID3D11Resource *)rt->tex);
+    if (G.scale > 1) {
+        /* Back to guest size first (linear filter averages the scaled
+         * pixels), then into the staging copy as at 1x. */
+        if (!G.down_tex || G.down_w != rt->w || G.down_h != rt->h) {
+            D3D11_TEXTURE2D_DESC td;
+            REL(G.down_rtv);
+            REL(G.down_tex);
+            memset(&td, 0, sizeof td);
+            td.Width = rt->w;
+            td.Height = rt->h;
+            td.MipLevels = td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_RENDER_TARGET;
+            if (FAILED(ID3D11Device_CreateTexture2D(G.dev, &td, NULL, &G.down_tex)) ||
+                FAILED(ID3D11Device_CreateRenderTargetView(G.dev,
+                           (ID3D11Resource *)G.down_tex, NULL, &G.down_rtv)) ||
+                !g_blit_init()) {
+                REL(G.down_rtv);
+                REL(G.down_tex);
+                g_time_end(&t0);
+                return;
+            }
+            G.down_w = rt->w;
+            G.down_h = rt->h;
+        }
+        g_blit(rt->srv, G.down_rtv, 0.0f, 0.0f, (float)rt->w, (float)rt->h, 1);
+        ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)G.staging,
+                                         (ID3D11Resource *)G.down_tex);
+    } else {
+        ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)G.staging,
+                                         (ID3D11Resource *)rt->tex);
+    }
     if (FAILED(ID3D11DeviceContext_Map(G.ctx, (ID3D11Resource *)G.staging, 0,
                                        D3D11_MAP_READ, 0, &m))) {
         g_time_end(&t0);
