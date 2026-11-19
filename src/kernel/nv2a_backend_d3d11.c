@@ -45,6 +45,7 @@
 #include <d3d11.h>
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
+#include <dxgi1_6.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,7 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dxguid.lib")
+#pragma comment(lib, "dxgi.lib")
 
 /* ---- Shaders ----------------------------------------------------------- */
 
@@ -355,12 +357,52 @@ static int g_init(void)
     HRESULT hr;
     const char *e;
 
-    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, levels, 2,
-                           D3D11_SDK_VERSION, &G.dev, &got, &G.ctx);
-    if (FAILED(hr))
-        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
-                               levels + 1, 1, D3D11_SDK_VERSION, &G.dev, &got,
-                               &G.ctx);
+    /* Laptops (Optimus/hybrid): the default adapter is often the integrated
+       GPU. Prefer the high-performance one; RECOMP_GPU_ADAPTER=default keeps
+       the system default. */
+    IDXGIAdapter1 *adapter = NULL;
+    e = getenv("RECOMP_GPU_ADAPTER");
+    if (!e || strcmp(e, "default") != 0) {
+        IDXGIFactory6 *f6 = NULL;
+        if (SUCCEEDED(CreateDXGIFactory1(&IID_IDXGIFactory6, (void **)&f6))) {
+            if (FAILED(IDXGIFactory6_EnumAdapterByGpuPreference(
+                    f6, 0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    &IID_IDXGIAdapter1, (void **)&adapter)))
+                adapter = NULL;
+            IDXGIFactory6_Release(f6);
+        }
+    }
+    {
+        D3D_DRIVER_TYPE dt = adapter ? D3D_DRIVER_TYPE_UNKNOWN
+                                     : D3D_DRIVER_TYPE_HARDWARE;
+        IDXGIAdapter *ad = (IDXGIAdapter *)adapter;
+        hr = D3D11CreateDevice(ad, dt, NULL, 0, levels, 2,
+                               D3D11_SDK_VERSION, &G.dev, &got, &G.ctx);
+        if (FAILED(hr))
+            hr = D3D11CreateDevice(ad, dt, NULL, 0, levels + 1, 1,
+                                   D3D11_SDK_VERSION, &G.dev, &got, &G.ctx);
+        if (FAILED(hr) && adapter)
+            hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+                                   levels, 2, D3D11_SDK_VERSION, &G.dev, &got,
+                                   &G.ctx);
+    }
+    if (SUCCEEDED(hr)) {
+        IDXGIDevice *xd = NULL;
+        IDXGIAdapter *used = NULL;
+        DXGI_ADAPTER_DESC desc;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(G.dev, &IID_IDXGIDevice,
+                                                  (void **)&xd)) &&
+            SUCCEEDED(IDXGIDevice_GetAdapter(xd, &used)) &&
+            SUCCEEDED(IDXGIAdapter_GetDesc(used, &desc))) {
+            fprintf(stderr, "[GPUB] adapter: %ls (%u MB VRAM)\n",
+                    desc.Description,
+                    (unsigned)(desc.DedicatedVideoMemory >> 20));
+            fflush(stderr);
+        }
+        if (used) IDXGIAdapter_Release(used);
+        if (xd) IDXGIDevice_Release(xd);
+    }
+    if (adapter) IDXGIAdapter1_Release(adapter);
     if (FAILED(hr)) {
         g_log_hr("D3D11CreateDevice", hr);
         return 0;
@@ -1342,16 +1384,27 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
     }
     {
         /* RECOMP_GPU_SHOT_DIR (+ _EVERY, default 60): the presented target
-         * as drawn, every n frames, at most 100 files. */
+         * as drawn, every n frames, at most 100 files. RECOMP_GPU_SHOT_FROM
+         * = seconds after the first resolve before shots start. */
         static const char *dir = (const char *)-1;
         static int every, shots;
+        static ULONGLONG shot_from, shot_ms;
         if (dir == (const char *)-1) {
             const char *e = getenv("RECOMP_GPU_SHOT_EVERY");
+            const char *fr = getenv("RECOMP_GPU_SHOT_FROM");
+            const char *ms = getenv("RECOMP_GPU_SHOT_EVERY_MS");
             dir = getenv("RECOMP_GPU_SHOT_DIR");
             every = e ? atoi(e) : 60;
             if (every < 1) every = 1;
+            /* RECOMP_GPU_SHOT_EVERY_MS: by wall time instead of frames (menus
+             * run >1000 FPS, so a frame interval burns the 100-shot cap). */
+            shot_ms = ms ? (ULONGLONG)atoi(ms) : 0;
+            if (shot_ms) every = 1;
+            shot_from = GetTickCount64() + (fr ? (ULONGLONG)(atof(fr) * 1000.0) : 0);
         }
-        if (dir && shots < 100 && G.frame % (uint32_t)every == 0) {
+        if (dir && shots < 100 && G.frame % (uint32_t)every == 0 &&
+            GetTickCount64() >= shot_from) {
+            if (shot_ms) shot_from = GetTickCount64() + shot_ms;
             char path[512];
             FILE *f;
             snprintf(path, sizeof path, "%s/shot-%05u.bmp", dir, G.frame);
