@@ -3,6 +3,7 @@ project(nv2a_surface_hazard_regression C)
 enable_testing()
 add_executable(nv2a-surface-hazard-test nv2a_surface_hazard_test.c
     ../../src/kernel/nv2a_pb_exec.c
+    ../../src/kernel/nv2a_backend_d3d11.c
     ../../src/kernel/nv2a_vsh_interp.c
     ../../src/kernel/nv2a_combiner.c)
 target_include_directories(nv2a-surface-hazard-test PRIVATE ../../src/kernel ../../src)

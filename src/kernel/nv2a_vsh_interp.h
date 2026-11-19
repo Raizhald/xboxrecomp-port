@@ -53,6 +53,17 @@ int nv2a_vsh_cxt_write_enabled(void);
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
 
+/* Diagnostics: whether the program from the start slot indexes constants
+ * by a0 (skinning), and the whole program state -- start slot, program
+ * memory, constants -- for an offline re-run. */
+int  nv2a_vsh_uses_a0(void);
+uint32_t nv2a_vsh_start_slot(void);
+void nv2a_vsh_snapshot(void *file);
+/* A ring of recent events (constant uploads, plus whatever the executor
+ * notes), printed by nv2a_vsh_ring_print. Diagnostics. */
+void nv2a_vsh_ring_note(uint32_t kind, uint32_t a, uint32_t b, uint32_t c);
+void nv2a_vsh_ring_print(void);
+
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
 const float *nv2a_vsh_constant(uint32_t index);   /* for traces */

@@ -3,6 +3,7 @@ project(nv2a_guard_band_regression C)
 enable_testing()
 add_executable(nv2a-guard-band-test nv2a_guard_band_test.c
     ../../src/kernel/nv2a_pb_exec.c
+    ../../src/kernel/nv2a_backend_d3d11.c
     ../../src/kernel/nv2a_vsh_interp.c
     ../../src/kernel/nv2a_combiner.c)
 target_include_directories(nv2a-guard-band-test PRIVATE ../../src/kernel ../../src)

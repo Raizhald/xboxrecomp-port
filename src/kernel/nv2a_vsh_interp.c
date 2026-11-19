@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static uint32_t s_program[NV2A_VSH_SLOTS][4];
 static float    s_const[NV2A_VSH_CONSTANTS][4];
@@ -94,8 +95,63 @@ void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 int nv2a_vsh_cxt_write_enabled(void) { return s_cxt_write != 0; }
 
+/* RECOMP_VSH_CTRACE=<seconds>: from then, log every constant upload that
+ * touches c[54..65] (where Fallout: BoS's bone 12 lives): start, length in
+ * words, and the values. At most 400 lines. Diagnostics. */
+static uint32_t s_ct_start, s_ct_words;
+static float    s_ct_vals[16][4];
+static void ctrace_flush(void)
+{
+    static long from = -2;
+    static int lines;
+    uint32_t end, i;
+    if (from == -2) {
+        const char *e = getenv("RECOMP_VSH_CTRACE");
+        from = e ? atol(e) : -1;
+    }
+    if (from < 0 || !s_ct_words || lines >= 400
+        || clock() / CLOCKS_PER_SEC < from)
+        return;
+    end = s_ct_start + (s_ct_words + 3) / 4;
+    if (end <= 54 || s_ct_start > 65)
+        return;
+    lines++;
+    fprintf(stderr, "[CT] t=%ld load c[%u] words %u\n", (long)clock(), s_ct_start, s_ct_words);
+    for (i = s_ct_start; i < end && i < s_ct_start + 16; i++)
+        if (i >= 54 && i <= 65)
+            fprintf(stderr, "[CT]   c[%u] %.4g %.4g %.4g %.4g\n", i,
+                    s_const[i][0], s_const[i][1], s_const[i][2], s_const[i][3]);
+}
+
+static struct { uint32_t kind, a, b, c; } s_ring[512];
+static uint32_t s_ring_n;
+void nv2a_vsh_ring_note(uint32_t kind, uint32_t a, uint32_t b, uint32_t c)
+{
+    uint32_t i = s_ring_n++ & 511;
+    s_ring[i].kind = kind; s_ring[i].a = a; s_ring[i].b = b; s_ring[i].c = c;
+}
+void nv2a_vsh_ring_print(void)
+{
+    uint32_t i = s_ring_n > 512 ? s_ring_n - 512 : 0;
+    for (; i < s_ring_n; i++) {
+        uint32_t k = i & 511;
+        if (s_ring[k].kind == 1)
+            fprintf(stderr, "[RING] load c[%u] words %u\n", s_ring[k].a, s_ring[k].b);
+        else if (s_ring[k].kind == 2)
+            fprintf(stderr, "[RING] batch n %u start %u a0 %u\n", s_ring[k].a, s_ring[k].b, s_ring[k].c);
+        else
+            fprintf(stderr, "[RING] note %u %08X %08X %08X\n", s_ring[k].kind,
+                    s_ring[k].a, s_ring[k].b, s_ring[k].c);
+    }
+}
+
 void nv2a_vsh_set_constant_load(uint32_t index)
 {
+    if (s_ct_words)
+        nv2a_vsh_ring_note(1, s_ct_start, s_ct_words, 0);
+    ctrace_flush();
+    s_ct_start = index;
+    s_ct_words = 0;
     s_const_load = index;
     s_const_word = 0;
     if (vsh_dump_enabled())
@@ -104,6 +160,7 @@ void nv2a_vsh_set_constant_load(uint32_t index)
 
 void nv2a_vsh_constant_word(uint32_t word)
 {
+    s_ct_words++;
     if (s_const_load < NV2A_VSH_CONSTANTS)
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
     else if (vsh_dump_enabled()) {
@@ -390,6 +447,29 @@ static vec4 run_ilu(uint32_t op, vec4 c)
     default: break;
     }
     return r;
+}
+
+uint32_t nv2a_vsh_start_slot(void) { return s_start_slot; }
+
+int nv2a_vsh_uses_a0(void)
+{
+    uint32_t s;
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        if (field(s_program[s], 3, 1, 1) || field(s_program[s], 1, 21, 4) == 13)
+            return 1;
+        if (field(s_program[s], 3, 0, 1))
+            break;
+    }
+    return 0;
+}
+
+void nv2a_vsh_snapshot(void *file)
+{
+    FILE *f = (FILE *)file;
+    uint32_t hdr[4] = { 0x48535631u, s_start_slot, NV2A_VSH_SLOTS, NV2A_VSH_CONSTANTS };
+    fwrite(hdr, 4, 4, f);
+    fwrite(s_program, sizeof s_program, 1, f);
+    fwrite(s_const, sizeof s_const, 1, f);
 }
 
 int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)

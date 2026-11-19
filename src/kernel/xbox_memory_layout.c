@@ -1483,10 +1483,22 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                             nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                                  XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
                         } else if (last_put && put < last_put) {
-                            if (put_hi > last_put)
-                                nv2a_pb_scan_segment(
-                                    XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                    XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
+                            /* The tail before the wrap runs to the JUMP D3D
+                             * wrote at the ring's end, and the walk stops at
+                             * that JUMP. The highest PUT seen is not that end:
+                             * whatever D3D wrote after its last kick there --
+                             * constants, vertex formats, texture state --
+                             * was skipped, and a method straddling the
+                             * highest PUT lost its remaining parameters (half
+                             * a bone matrix: a character's arm stretched
+                             * across the screen in Fallout: BoS). The bound
+                             * only guards a ring reset without a JUMP:
+                             * the highest PUT rounded up to 64 KB. */
+                            uint32_t tail_end = ((put_hi > last_put ? put_hi : last_put)
+                                                 + 4u + 0xFFFFu) & ~0xFFFFu;
+                            nv2a_pb_scan_segment(
+                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                XBOX_CONTIG_BASE | (tail_end & 0x0FFFFFFFu));
                             if (put > put_lo)
                                 nv2a_pb_scan_segment(
                                     XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),

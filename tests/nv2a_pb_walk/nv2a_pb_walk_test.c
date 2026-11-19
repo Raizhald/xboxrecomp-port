@@ -52,6 +52,7 @@ void xbox_Nv2aAckBusyBits(void) {}
 
 void nv2a_pb_resync(uint32_t get_phys);
 void nv2a_pb_scan(uint32_t put_phys);
+void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va);
 
 static int s_fail;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); s_fail = 1; } } while (0)
@@ -226,6 +227,42 @@ int main(void)
         nv2a_pb_scan(0xE0C);                               /* in step again */
         CHECK(s_n == n0 + 1);
         expect(n0, 0x0710, 61);
+    }
+
+    /* The segment scan (the default walk): a burst that PUT splits -- here a
+     * 16-word vertex-shader constant upload, cut after its first word -- is
+     * finished by the next segment, which starts where PUT was. It used to be
+     * cut short there and the rest read as headers: 1.0f (0x3F800000) is a
+     * well-formed method header, so the upload lost 15 words and the stream
+     * ran on as garbage. */
+    {
+        int n0 = s_n, i, ok = 1;
+        float one = 1.0f;
+        uint32_t f1;
+        memcpy(&f1, &one, 4);
+        put(0xF00, hdr(16, 0, 0x0B80));
+        for (i = 0; i < 16; i++)
+            put(0xF04 + 4 * i, i == 0 ? 0x1234u : f1 + (uint32_t)i);
+        put(0xF44, hdr(1, 0, 0x0720)); put(0xF48, 71);
+        nv2a_pb_scan_segment(0x80000F00u, 0x80000F08u);   /* header + 1 word */
+        CHECK(s_n == n0 + 1);
+        nv2a_pb_scan_segment(0x80000F08u, 0x80000F20u);   /* 6 more words */
+        CHECK(s_n == n0 + 7);
+        nv2a_pb_scan_segment(0x80000F20u, 0x80000F4Cu);   /* the rest, and on */
+        CHECK(s_n == n0 + 17);
+        for (i = 0; i < 16; i++)
+            if (!(n0 + i < 64 && s_seen[n0 + i].method == 0x0B80u + 4u * (uint32_t)i
+                  && s_seen[n0 + i].param == (i == 0 ? 0x1234u : f1 + (uint32_t)i)))
+                ok = 0;
+        CHECK(ok);
+        expect(n0 + 16, 0x0720, 71);
+        /* A segment elsewhere (the ring wrapped) does not resume a burst. */
+        put(0xF80, hdr(4, 0, 0x0B80)); put(0xF84, 1);
+        nv2a_pb_scan_segment(0x80000F80u, 0x80000F88u);
+        put(0x0E80, hdr(1, 0, 0x0724)); put(0x0E84, 72);
+        nv2a_pb_scan_segment(0x80000E80u, 0x80000E88u);
+        CHECK(s_n == n0 + 19);
+        expect(n0 + 18, 0x0724, 72);
     }
 
     if (!s_fail)

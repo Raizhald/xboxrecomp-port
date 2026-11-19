@@ -462,11 +462,58 @@ int nv2a_pb_dma_walk(void)
  * wrap is handled by the caller, which scans the two pieces separately.
  * Addresses are physical, like PUT's, and reach guest memory through the
  * contiguous window. */
+/* A method whose parameters ran past the end of the segment -- PUT came in
+ * the middle of them, which D3D does whenever a kick splits a burst. The DMA
+ * engine stalls at PUT and carries on with the same method when PUT moves,
+ * so the next segment, which starts exactly there, begins with the rest of
+ * these parameters. Dropping them instead read the rest of the burst as
+ * command headers: a vertex-shader constant upload that lost 15 of its 16
+ * words left a bone matrix half stale, and that bone's vertices flew off
+ * across the screen (Fallout: BoS, the player character's limbs). */
+static struct {
+    int active;
+    uint32_t resume_va, method, subch, i, left;
+    int noninc;
+} s_seg_pend;
+static uint32_t s_seg_resumed, s_seg_split;
+
 static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                 uint32_t *jumps, uint32_t *unknown)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
+
+    if (!in_call && s_seg_pend.active) {
+        if (s_seg_pend.resume_va == va) {
+            s_seg_resumed++;
+            while (s_seg_pend.left && va < end_va) {
+                uint32_t m = s_seg_pend.noninc ? s_seg_pend.method
+                                               : s_seg_pend.method + s_seg_pend.i * 4;
+                note(s_seg_pend.subch, m);
+                if (s_exec_enabled)
+                    nv2a_pb_exec_method(s_seg_pend.subch, m,
+                                        *(const uint32_t *)(mem + va));
+                va += 4;
+                words++;
+                s_seg_pend.i++;
+                s_seg_pend.left--;
+            }
+            if (s_seg_pend.left) {             /* still not all there */
+                s_seg_pend.resume_va = va;
+                return words;
+            }
+        }
+        /* Done -- or the walk went somewhere else (the ring wrapped at a
+         * JUMP, which never falls inside a burst). */
+        else {
+            static int said;
+            if (said++ < 20)
+                fprintf(stderr, "[PB] split method %04X lost %u words: resume at"
+                        " 0x%08X, next segment starts 0x%08X\n", s_seg_pend.method,
+                        s_seg_pend.left, s_seg_pend.resume_va, va);
+        }
+        s_seg_pend.active = 0;
+    }
 
     while (va < end_va && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)(mem + va);
@@ -502,7 +549,8 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            uint32_t i;
+            for (i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
                 if (s_exec_enabled)
@@ -510,6 +558,16 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                         *(const uint32_t *)(mem + va));
                 va += 4;
                 words++;
+            }
+            if (i < count && !in_call) {
+                s_seg_pend.active = 1;
+                s_seg_pend.resume_va = va;
+                s_seg_pend.method = method;
+                s_seg_pend.subch = subch;
+                s_seg_pend.noninc = noninc;
+                s_seg_pend.i = i;
+                s_seg_pend.left = count - i;
+                s_seg_split++;
             }
             continue;
         }

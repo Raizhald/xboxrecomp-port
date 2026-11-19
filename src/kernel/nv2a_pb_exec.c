@@ -40,6 +40,8 @@
 #include "nv2a_backend.h"
 #if defined(_WIN32)
 #include <windows.h>
+#include <mmsystem.h>                /* timeBeginPeriod: RECOMP_FPS_LIMIT */
+#pragma comment(lib, "winmm.lib")
 #define NV_TLS __declspec(thread)
 #else
 #define NV_TLS __thread
@@ -780,6 +782,53 @@ static void surface_apply_clip(void)
     RS.clip_h = ((s_gpu.clip_raw_v >> 16) & 0xFFFF) * sy;
 }
 
+/* RECOMP_FPS_LIMIT=<fps>: at most that many flips a second. Nothing else
+ * paces the title: the flip completes at once and vblank is not waited on,
+ * so with a fast renderer the game would run as fast as the host allows.
+ * The executor -- the thread whose progress the title waits for -- sleeps
+ * until the next frame boundary; a frame that ran late moves the boundary
+ * instead of being made up with a burst. Off by default (benchmarks measure
+ * the unpaced rate). */
+static void frame_limit(void)
+{
+#if defined(_WIN32)
+    static double period = -1.0, next;
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    double t;
+
+    if (period < 0.0) {
+        const char *e = getenv("RECOMP_FPS_LIMIT");
+        double fps = e ? atof(e) : 0.0;
+        period = fps > 0.0 ? 1.0 / fps : 0.0;
+        QueryPerformanceFrequency(&freq);
+        if (period > 0.0) {
+            timeBeginPeriod(1);
+            fprintf(stderr, "[GPU] RECOMP_FPS_LIMIT: %.1f frames a second\n", fps);
+        }
+    }
+    if (period <= 0.0)
+        return;
+    QueryPerformanceCounter(&now);
+    t = (double)now.QuadPart / (double)freq.QuadPart;
+    if (next == 0.0 || t > next + period) {
+        next = t + period;                     /* first frame, or far behind */
+        return;
+    }
+    /* Sleep to about 1.5 ms before the boundary, then spin the rest. */
+    while (t < next) {
+        double left = next - t;
+        if (left > 0.0015)
+            Sleep((DWORD)((left - 0.0015) * 1000.0));
+        else
+            YieldProcessor();
+        QueryPerformanceCounter(&now);
+        t = (double)now.QuadPart / (double)freq.QuadPart;
+    }
+    next += period;
+#endif
+}
+
 /* ---- Render back end (nv2a_backend.h) ------------------------------- */
 
 static const Nv2aBackend *s_backend;
@@ -788,6 +837,20 @@ void nv2a_backend_register(const Nv2aBackend *backend)
 {
     s_backend = backend;
 }
+
+/* RECOMP_NULL_BACKEND=<seconds>: from the first flip after that many
+ * seconds of process time, a back end that draws nothing (later, so a
+ * timed pad script still reaches the scene at the speed it expects).
+ * Everything up to
+ * rasterisation still runs (pushbuffer decode, vertex programs, clipping,
+ * the title itself), so the frame rate it gives is the ceiling for any
+ * renderer -- what a GPU back end could reach at best. Measurement only:
+ * the screen stays black. */
+static void null_backend_draw(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    (void)s; (void)b;
+}
+static const Nv2aBackend k_null_backend = { NULL, null_backend_draw, NULL };
 
 static int backend_draws(void)
 {
@@ -803,6 +866,8 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    out->clip_x          = RS.clip_x;
+    out->clip_y          = RS.clip_y;
 }
 
 /* Render state in the NV2A's own values, gathered from what the executor
@@ -836,6 +901,8 @@ static void current_render_state(Nv2aRenderState *r)
     r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
     r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
+    r->zmax              = ((s_gpu.format >> 4) & 0xF) == 1 ? 65535.0f
+                                                             : 16777215.0f;
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
@@ -853,7 +920,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     RS.texs[0].color  = tex->color;
     RS.texs[0].addr_u = 3;
     RS.texs[0].addr_v = 3;
-    RS.texs[0].palette = 0;          /* ponytail: no palettised formats */
+    RS.texs[0].palette = tex->palette;
     RS.texs[0].levels = 1;
     RS.texs[0].filter = 0;
     RS.texs[0].cube   = 0;
@@ -866,6 +933,30 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
             }
     RS.texs[0] = saved;
     return ok;
+}
+
+static uint32_t tex_texel_bytes(uint32_t fmt);
+
+uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex)
+{
+    uint32_t block = d3d8_format_dxt_block_bytes(tex->color);
+    if (!tex->width || !tex->height)
+        return 0;
+    if (!tex_size_from_format(tex->color))
+        return tex->pitch * tex->height;
+    if (block)
+        return ((tex->width + 3) / 4) * ((tex->height + 3) / 4) * block;
+    return tex->width * tex->height * tex_texel_bytes(tex->color);
+}
+
+const uint8_t *nv2a_backend_guest(uint32_t guest_va)
+{
+    return (const uint8_t *)xbox_GetMemoryOffset() + guest_va;
+}
+
+int nv2a_backend_surface_ok(uint32_t guest_va, uint32_t bytes)
+{
+    return guest_va && !surface_write_refused(guest_va, bytes, "resolve");
 }
 
 static void clear_surface(uint32_t param)
@@ -1928,6 +2019,11 @@ static int s_xf_no_tex;
 #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
 static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
 static uint32_t   s_bcount;
+/* The per-pixel inputs of transformed batches (Nv2aBatch.ext), parallel to
+ * s_bverts; s_bext_used says the current batch filled them. */
+static Nv2aVertexEx *s_bext;
+static int          s_bext_used;
+static float fog_factor(float d);
 
 static Nv2aVertex *backend_slot(void)
 {
@@ -1937,6 +2033,31 @@ static Nv2aVertex *backend_slot(void)
     if (s_bcount + 3 > NV_BACKEND_MAX_VERTS)
         return NULL;
     return &s_bverts[s_bcount];
+}
+
+static void backend_ext_from_xf(const Nv2aVshOutput *v, Nv2aVertexEx *e)
+{
+    memcpy(e->d0, v->d0, sizeof e->d0);
+    memcpy(e->d1, v->d1, sizeof e->d1);
+    e->fog = fog_factor(v->fog[0]);
+    e->pad[0] = e->pad[1] = e->pad[2] = 0.0f;
+    memcpy(e->tex, v->tex, sizeof e->tex);
+}
+
+static void backend_tex(const Texture *t, Nv2aTexture *o)
+{
+    o->offset = t->offset;
+    o->width  = t->width;
+    o->height = t->height;
+    o->pitch  = t->pitch;
+    o->color  = t->color;
+    o->addr_u = t->addr_u;
+    o->addr_v = t->addr_v;
+    o->levels = t->pitch ? 1 : t->levels;
+    o->filter = t->filter;
+    o->palette = t->palette;
+    o->cube   = (uint32_t)t->cube;
+    o->normalized = (uint32_t)tex_size_from_format(t->color);
 }
 
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
@@ -1962,30 +2083,47 @@ static void backend_flush(int textured)
 {
     Nv2aSurface surf;
     Nv2aRenderState rs;
-    Nv2aTexture tex;
+    Nv2aTexture tex, stex[4];
     Nv2aBatch batch;
+    static int no_rc = -1;
+    int st;
 
     if (!s_bcount)
         return;
+    if (no_rc < 0)
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
     current_surface(&surf);
     current_render_state(&rs);
+    memset(&batch, 0, sizeof batch);
     batch.vertices = s_bverts;
     batch.count = s_bcount;
     batch.texture = NULL;
     batch.state = &rs;
     if (textured && RS.texs[0].valid) {
-        tex.offset = RS.texs[0].offset;
-        tex.width  = RS.texs[0].width;
-        tex.height = RS.texs[0].height;
-        tex.pitch  = RS.texs[0].pitch;
-        tex.color  = RS.texs[0].color;
-        tex.addr_u = RS.texs[0].addr_u;
-        tex.addr_v = RS.texs[0].addr_v;
-        tex.levels = RS.texs[0].pitch ? 1 : RS.texs[0].levels;
-        tex.filter = RS.texs[0].filter;
+        backend_tex(&RS.texs[0], &tex);
         batch.texture = &tex;
     }
+    if (s_bext_used) {
+        batch.ext = s_bext;
+        batch.stage[0] = batch.texture;
+        if (s_gpu.rc_seen && !no_rc) {
+            /* Shaded as xf_rows does: every stage the shader program
+             * enables, whether or not the batch had coordinates. */
+            batch.rc = &RS.rc;
+            for (st = 0; st < 4; st++) {
+                batch.stage[st] = NULL;
+                if (((RS.rc.stage_program >> (st * 5)) & 0x1F)
+                    && RS.texs[st].valid) {
+                    backend_tex(&RS.texs[st], &stex[st]);
+                    batch.stage[st] = &stex[st];
+                }
+            }
+        }
+        batch.fog_color = s_gpu.fog_color;
+        batch.clip_plane_mode = RS.clip_plane_mode;
+    }
     s_backend->draw(&surf, &batch);
+    s_bext_used = 0;
     s_gpu.tris_drawn += s_bcount / 3;
     s_bcount = 0;
     note_drawn();
@@ -2972,11 +3110,20 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     }
     if (backend_draws()) {                     /* a back end rasterises */
         Nv2aVertex *o = backend_slot();
+        if (o && !s_bext
+            && !(s_bext = (Nv2aVertexEx *)calloc(NV_BACKEND_MAX_VERTS,
+                                                 sizeof *s_bext)))
+            o = NULL;
         if (o) {
+            Nv2aVertexEx *e = &s_bext[s_bcount];
             backend_from_xf(va, &o[0]);
             backend_from_xf(vb, &o[1]);
             backend_from_xf(vc, &o[2]);
+            backend_ext_from_xf(va, &e[0]);
+            backend_ext_from_xf(vb, &e[1]);
+            backend_ext_from_xf(vc, &e[2]);
             s_bcount += 3;
+            s_bext_used = 1;
         }
         return;
     }
@@ -3280,6 +3427,61 @@ static void raster_batch_program(void)
         s_vcache[slot].pos = i;
         s_vcache[slot].gen = s_vcache_gen;
     }
+    {
+        /* RECOMP_SKIN_DUMP=<dir>: a skinned batch (its program indexes c[] by
+         * a0) whose vertices spread over more than 160 surface pixels --
+         * a character mesh pulled apart -- is written out whole: program,
+         * constants, and per vertex the index, the 16 inputs and oPos.
+         * At most 6 files. Diagnostics only. */
+        static const char *dir = (const char *)-1;
+        static int dumps;
+        if (dir == (const char *)-1)
+            dir = getenv("RECOMP_SKIN_DUMP");
+        static long from = -1;
+        if (from < 0) {
+            const char *e = getenv("RECOMP_SKIN_DUMP_FROM");    /* seconds */
+            from = e ? atol(e) : 0;
+        }
+        if (dir && dumps < 6 && n >= 200 && batch_uses_program()
+            && clock() / CLOCKS_PER_SEC >= from && nv2a_vsh_uses_a0()) {
+            float lo[2] = { 3e38f, 3e38f }, hi[2] = { -3e38f, -3e38f };
+            for (i = 0; i < n; i++) {
+                int k;
+                if (!(s_xf[i].pos[3] > 0.0f)) continue;
+                for (k = 0; k < 2; k++) {
+                    if (s_xf[i].pos[k] < lo[k]) lo[k] = s_xf[i].pos[k];
+                    if (s_xf[i].pos[k] > hi[k]) hi[k] = s_xf[i].pos[k];
+                }
+            }
+            if (hi[0] - lo[0] > 160.0f || hi[1] - lo[1] > 160.0f) {
+                char path[512];
+                FILE *f;
+                snprintf(path, sizeof path, "%s/skin-%u-%u.bin", dir, s_gpu.flips, dumps);
+                if ((f = fopen(path, "wb")) != NULL) {
+                    uint32_t a;
+                    nv2a_vsh_snapshot(f);
+                    fwrite(&n, 4, 1, f);
+                    for (a = 0; a < 16; a++)
+                        fwrite(&s_gpu.attr[a], sizeof s_gpu.attr[a], 1, f);
+                    for (i = 0; i < n; i++) {
+                        float in[NV2A_VSH_INPUTS][4];
+                        for (a = 0; a < NV2A_VSH_INPUTS; a++)
+                            fetch_attr(&s_gpu.attr[a], s_gpu.idx[i], in[a]);
+                        fwrite(&s_gpu.idx[i], 4, 1, f);
+                        fwrite(in, sizeof in, 1, f);
+                        fwrite(s_xf[i].pos, 16, 1, f);
+                    }
+                    fclose(f);
+                    fprintf(stderr, "[SKIN] dumped %s: %u vertices over %.0fx%.0f px\n",
+                            path, n, hi[0] - lo[0], hi[1] - lo[1]);
+                    nv2a_vsh_ring_print();
+                    dumps++;
+                }
+            }
+        }
+    }
+    if (batch_uses_program())
+        nv2a_vsh_ring_note(2, n, nv2a_vsh_start_slot(), (uint32_t)nv2a_vsh_uses_a0());
     xf_set_viewport();
     {
         const VertexAttr *tc = texcoord_attr();
@@ -4211,7 +4413,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     param, s_gpu.color_offset, RS.clip_w, RS.clip_h,
                     s_gpu.clear_color, 10);
         clear_surface(param);
-        if (param & 0x01)                         /* Z */
+        /* A back end that clears keeps its own depth buffers. */
+        if ((param & 0x01) && !(s_backend && s_backend->clear))   /* Z */
             zbuf_clear();
         break;
 
@@ -4331,6 +4534,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                : s_gpu.color_offset;
             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                 : RS.pitch;
+            if (done && s_backend && s_backend->resolve)
+                s_backend->resolve(dma_resolve(done), pitch, surface_bpp());
             if (done) {
                 xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                 xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
@@ -4359,8 +4564,46 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         s_gpu.drawn_stale = 1;
+        {
+            static long null_after = -2;
+            if (null_after == -2) {
+                const char *e = getenv("RECOMP_NULL_BACKEND");
+                null_after = e ? atol(e) : -1;
+            }
+            if (null_after >= 0 && !s_backend
+                && clock() / CLOCKS_PER_SEC >= null_after) {
+                pipe_drain();
+                fprintf(stderr, "[GPU] RECOMP_NULL_BACKEND: drawing nothing from"
+                        " flip %u\n", s_gpu.flips);
+                nv2a_backend_register(&k_null_backend);
+                null_after = -1;
+            }
+        }
+        {
+            /* RECOMP_GPU_BACKEND=<seconds>: draw on the GPU (Direct3D 11)
+             * from the first flip after that many seconds of process time.
+             * Later rather than at once for the same reason as above. */
+            static long gpu_after = -2;
+            if (gpu_after == -2) {
+                const char *e = getenv("RECOMP_GPU_BACKEND");
+                gpu_after = e ? atol(e) : -1;
+            }
+            if (gpu_after >= 0 && !s_backend
+                && clock() / CLOCKS_PER_SEC >= gpu_after) {
+                const Nv2aBackend *gpu;
+                pipe_drain();
+                gpu = nv2a_backend_d3d11();
+                fprintf(stderr, "[GPU] RECOMP_GPU_BACKEND: %s from flip %u\n",
+                        gpu ? "Direct3D 11 back end" : "no device, staying on"
+                        " the software renderer", s_gpu.flips);
+                if (gpu)
+                    nv2a_backend_register(gpu);
+                gpu_after = -1;
+            }
+        }
         if (s_backend && s_backend->flip)
             s_backend->flip();
+        frame_limit();
 
         if (verbose) {
             static unsigned n;

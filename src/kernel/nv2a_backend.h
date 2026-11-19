@@ -20,14 +20,19 @@
  * so a back end only ever sees surface pixels. Blend, depth, alpha, cull and
  * stencil state arrive in Nv2aRenderState.
  *
- * ponytail: register-combiner state and texture stages 1-3 are not passed on:
- * a back end sees stage 0 and the diffuse colour. Extend Nv2aBatch when that
- * matters rather than adding callbacks.
+ * Batches drawn through a vertex program or the fixed-function transform also
+ * carry Nv2aBatch.ext (per vertex: both colours, the fog factor, all four
+ * texture coordinates) and, once the title has programmed them, the register
+ * combiners and all four texture stages -- everything the software
+ * rasteriser uses per pixel, so a GPU back end can produce the same image.
+ * Screen-space batches carry stage 0 and the diffuse colour only.
  */
 #ifndef NV2A_BACKEND_H
 #define NV2A_BACKEND_H
 
 #include <stdint.h>
+
+#include "nv2a_combiner.h"
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
@@ -38,6 +43,7 @@ typedef struct {
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
+    uint32_t clip_x, clip_y;    /* top-left of the clip rectangle, real pixels */
 } Nv2aSurface;
 
 /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
@@ -51,6 +57,12 @@ typedef struct {
      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
      * 16-23). A back end that ignores them samples level 0. */
     uint32_t levels, filter;
+    uint32_t palette;           /* guest address of the CLUT (P8 formats), or 0 */
+    uint32_t cube;              /* six faces */
+    /* Coordinates the title gives are normalised (swizzled and DXT formats)
+     * rather than texels (linear formats). Only Nv2aVertexEx.tex is raw;
+     * Nv2aVertex.u/v are always texels. */
+    uint32_t normalized;
 } Nv2aTexture;
 
 typedef struct {
@@ -59,6 +71,17 @@ typedef struct {
     uint32_t diffuse;           /* 0xAARRGGBB */
     float    u, v;              /* texels */
 } Nv2aVertex;
+
+/* The rest of what the transform produced for a vertex, as the software
+ * rasteriser uses it: colours unclamped, the fog factor already through the
+ * fog unit (1 = no fog), texture coordinates as the program wrote them
+ * (divide by .w per pixel for projective stages). */
+typedef struct {
+    float d0[4], d1[4];         /* r,g,b,a */
+    float fog;
+    float pad[3];
+    float tex[4][4];
+} Nv2aVertexEx;
 
 /* Render state as the title set it, in NV2A's own (OpenGL) enum values:
  * blend factors GL_ZERO/GL_ONE/0x300..0x308/0x8001..0x8004, equations
@@ -80,6 +103,9 @@ typedef struct {
      * that ignores these draws that pass over the whole surface. */
     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+    /* Largest depth value of the zeta format (65535 for Z16, 16777215 for
+     * Z24S8): vertex z divided by it is the [0,1] depth. */
+    float    zmax;
 } Nv2aRenderState;
 
 typedef struct {
@@ -87,6 +113,15 @@ typedef struct {
     uint32_t           count;
     const Nv2aTexture *texture;     /* NULL: untextured */
     const Nv2aRenderState *state;
+    /* NULL for screen-space batches. Same count as vertices. */
+    const Nv2aVertexEx *ext;
+    /* Register combiners, when the batch is shaded by them (NULL: diffuse
+     * times texture 0, the way the software rasteriser draws without them). */
+    const Nv2aCombiner *rc;
+    /* Per stage: the bound texture, NULL when the stage has none. */
+    const Nv2aTexture  *stage[4];
+    uint32_t fog_color;         /* SET_FOG_COLOR: R in bits 0-7 */
+    uint32_t clip_plane_mode;   /* SET_SHADER_CLIP_PLANE_MODE */
 } Nv2aBatch;
 
 typedef struct {
@@ -96,6 +131,10 @@ typedef struct {
                   uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
     void (*flip)(void);
+    /* Write what the back end drew into the colour surface at `color_va`
+     * back to guest memory, in the surface's own format. Called at a flip
+     * for the buffer being presented, before anything reads it. */
+    void (*resolve)(uint32_t color_va, uint32_t pitch, uint32_t bytes_per_pixel);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
@@ -106,6 +145,20 @@ void nv2a_backend_register(const Nv2aBackend *backend);
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+
+/* Bytes of guest memory level 0 of a texture occupies (0 if unknown), and
+ * a host pointer to a guest address. For change detection. */
+uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex);
+const uint8_t *nv2a_backend_guest(uint32_t guest_va);
+
+/* Whether the back end may write `bytes` of surface at `guest_va` (not the
+ * loaded image, a stack, or outside guest memory). */
+int nv2a_backend_surface_ok(uint32_t guest_va, uint32_t bytes);
+
+/* The Direct3D 11 back end (nv2a_backend_d3d11.c): NULL when no device
+ * could be created or off Windows. RECOMP_GPU_BACKEND=<seconds> registers it
+ * at the first flip after that many seconds of process time. */
+const Nv2aBackend *nv2a_backend_d3d11(void);
 
 /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
  * of the semaphore the title reads GPU progress from (for XDK D3D, the
