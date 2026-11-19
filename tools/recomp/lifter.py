@@ -1898,7 +1898,12 @@ class Lifter:
             r = ops[1].reg
             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
                 src = f"SX8({src})"
-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
+            # bp and sp too: "movsx ebp, bp" had come out as a plain zero
+            # extension, and Bink's IDCT keeps row 6 of each column in bp --
+            # every negative coefficient there became 65535-ish, which is
+            # the checkerboard 8x8 blocks in Fallout: Brotherhood of Steel's
+            # videos (movzx just above already listed them).
+            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
                 src = f"SX16({src})"
         return [_fmt_operand_write(ops[0], src)]
 
@@ -2127,16 +2132,25 @@ class Lifter:
                 f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
                 f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
             ]
+        # The two- and three-operand forms keep only the low half of the
+        # product, and the low half is the same for a signed and an unsigned
+        # multiply. So multiply unsigned: x86 wraps modulo 2^32, and so does
+        # C for uint32_t. The old "(int32_t)a * (int32_t)b" overflows for big
+        # products, which is undefined in C -- MSVC on x64 kept the product in
+        # a 64-bit register and the following "sar" shifted bits that x86 had
+        # dropped. Bink's IDCT multiplies by constants like 0xFFFFEB18 and
+        # sars by 11; large coefficients came out as garbage 8x8 blocks in
+        # every Fallout: Brotherhood of Steel video.
         elif nops == 2:
             # Two operand: dst = dst * src
             dst = _fmt_operand_read(ops[0])
             src = _fmt_operand_read(ops[1])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} * (int32_t){src})")]
+            return [_fmt_operand_write(ops[0], f"(uint32_t)((uint32_t)({dst}) * (uint32_t)({src}))")]
         elif nops == 3:
             # Three operand: dst = src1 * imm
             src = _fmt_operand_read(ops[1])
             imm = _fmt_operand_read(ops[2])
-            return [_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){src} * (int32_t){imm})")]
+            return [_fmt_operand_write(ops[0], f"(uint32_t)((uint32_t)({src}) * (uint32_t)({imm}))")]
         return ["/* imul: unexpected form */"]
 
     def _lift_muldiv(self, insn, ops, m):

@@ -1048,6 +1048,16 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
         recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
 } while(0)
+#elif defined(RECOMP_DIFFTEST)
+/* Opt-in differential testing: the project snapshots guest state around one
+ * chosen call (pre returns non-zero for that call) so the original code can
+ * be replayed in an emulator from the same state. */
+int  recomp_difftest_pre(uint32_t va);
+void recomp_difftest_post(uint32_t va);
+#define RECOMP_ABI_CALL(va, fn) do { \
+    if (recomp_difftest_pre(va)) { (fn)(); recomp_difftest_post(va); } \
+    else (fn)(); \
+} while(0)
 #elif defined(RECOMP_CALL_PROFILE)
 /* Opt-in profiling: every direct call reports its target to the project, which
  * keeps the counts (a project defines recomp_call_profile_hit). Diffing the counts
