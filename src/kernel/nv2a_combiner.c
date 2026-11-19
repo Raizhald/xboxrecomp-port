@@ -21,12 +21,31 @@
 enum { R_ZERO = 0, R_C0 = 1, R_C1 = 2, R_FOG = 3, R_V0 = 4, R_V1 = 5,
        R_T0 = 8, R_R0 = 12, R_R1 = 13, R_SUM = 14, R_EF = 15 };
 
+/* n / 255.0f for every byte n, built on first use. The rasteriser unpacks
+ * four texels per bilinear sample, so this ran sixteen float divisions per
+ * pixel; the table holds the same quotients, bit for bit. Filling it twice
+ * from two threads writes the same values, so no lock. */
+static float s_unorm8[256];
+static volatile int s_unorm8_ready;
+
+static const float *unorm8(void)
+{
+    if (!s_unorm8_ready) {
+        int i;
+        for (i = 0; i < 256; i++)
+            s_unorm8[i] = (float)i / 255.0f;
+        s_unorm8_ready = 1;
+    }
+    return s_unorm8;
+}
+
 void nv2a_rc_unpack(uint32_t c, float o[4])
 {
-    o[0] = (float)((c >> 16) & 0xFF) / 255.0f;
-    o[1] = (float)((c >>  8) & 0xFF) / 255.0f;
-    o[2] = (float)( c        & 0xFF) / 255.0f;
-    o[3] = (float)( c >> 24        ) / 255.0f;
+    const float *t = unorm8();
+    o[0] = t[(c >> 16) & 0xFF];
+    o[1] = t[(c >>  8) & 0xFF];
+    o[2] = t[ c        & 0xFF];
+    o[3] = t[ c >> 24        ];
 }
 
 /* D3DCOLOR to floats, memoised: a program's constants are the same for
@@ -67,25 +86,58 @@ static float map_in(float x, uint32_t byte)
     }
 }
 
-/* PS_COMBINEROUTPUT scale/bias, psh.c get_output. */
-static float map_out(float x, uint32_t mapping)
+/* PS_COMBINEROUTPUT scale/bias (psh.c get_output) as (x - bias) * scale:
+ * x - 0.5, x * 2, (x - 0.5) * 2, x * 4, x * 0.5 or x. Each is exact in that
+ * form, since x - 0 and x * 1 are x itself. */
+static void out_map(uint32_t mapping, float *bias, float *scale)
 {
     switch (mapping) {
-    case 0x08: return x - 0.5f;
-    case 0x10: return x * 2.0f;
-    case 0x18: return (x - 0.5f) * 2.0f;
-    case 0x20: return x * 4.0f;
-    case 0x30: return x * 0.5f;
-    default:   return x;
+    case 0x08: *bias = 0.5f; *scale = 1.0f; return;
+    case 0x10: *bias = 0.0f; *scale = 2.0f; return;
+    case 0x18: *bias = 0.5f; *scale = 2.0f; return;
+    case 0x20: *bias = 0.0f; *scale = 4.0f; return;
+    case 0x30: *bias = 0.0f; *scale = 0.5f; return;
+    default:   *bias = 0.0f; *scale = 1.0f; return;
     }
 }
 
 static void read_rgb(float R[16][4], uint32_t byte, float v[3])
 {
     const float *r = R[byte & 0xF];
+    float x[3];
     int i;
-    for (i = 0; i < 3; i++)
-        v[i] = map_in((byte & 0x10) ? r[3] : r[i], byte);
+
+    if (byte & 0x10) {
+        x[0] = x[1] = x[2] = r[3];
+    } else {
+        x[0] = r[0]; x[1] = r[1]; x[2] = r[2];
+    }
+    switch ((byte >> 5) & 7) {
+    case 0:
+        for (i = 0; i < 3; i++) v[i] = x[i] < 0.0f ? 0.0f : x[i];
+        return;
+    case 1:
+        for (i = 0; i < 3; i++) v[i] = 1.0f - clampf(x[i], 0.0f, 1.0f);
+        return;
+    case 2:
+        for (i = 0; i < 3; i++) v[i] = 2.0f * (x[i] < 0.0f ? 0.0f : x[i]) - 1.0f;
+        return;
+    case 3:
+        for (i = 0; i < 3; i++) v[i] = -2.0f * (x[i] < 0.0f ? 0.0f : x[i]) + 1.0f;
+        return;
+    case 4:
+        for (i = 0; i < 3; i++) v[i] = (x[i] < 0.0f ? 0.0f : x[i]) - 0.5f;
+        return;
+    case 5:
+        for (i = 0; i < 3; i++) v[i] = -(x[i] < 0.0f ? 0.0f : x[i]) + 0.5f;
+        return;
+    case 6:
+        for (i = 0; i < 3; i++) v[i] = x[i];
+        return;
+    default:
+        for (i = 0; i < 3; i++) v[i] = -x[i];
+        return;
+    }
 }
 
 static float read_alpha(float R[16][4], uint32_t byte)
@@ -143,22 +195,30 @@ void nv2a_rc_eval(const Nv2aCombiner *rc, const float v0[4],
         aA = read_alpha(R, aicw >> 24); aB = read_alpha(R, aicw >> 16);
         aC = read_alpha(R, aicw >> 8);  aD = read_alpha(R, aicw);
 
-        for (i = 0; i < 3; i++) {
+        {
+            /* The dot products and the output mapping are the same for all
+             * three channels; work them out once (out_map: the same values the per-channel
+             * scale/bias switch gave). */
             float dab = A[0] * B[0] + A[1] * B[1] + A[2] * B[2];
             float dcd = C[0] * D[0] + C[1] * D[1] + C[2] * D[2];
-            float pab = (fl & 2) ? dab : A[i] * B[i];
-            float pcd = (fl & 1) ? dcd : C[i] * D[i];
-            float sum = (fl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
-            ab[i] = clampf(map_out(pab, fl & 0x38), -1.0f, 1.0f);
-            cd[i] = clampf(map_out(pcd, fl & 0x38), -1.0f, 1.0f);
-            ms[i] = clampf(map_out(sum, fl & 0x38), -1.0f, 1.0f);
+            float ob, os;
+            out_map(fl & 0x38, &ob, &os);
+            for (i = 0; i < 3; i++) {
+                float pab = (fl & 2) ? dab : A[i] * B[i];
+                float pcd = (fl & 1) ? dcd : C[i] * D[i];
+                float sum = (fl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
+                ab[i] = clampf((pab - ob) * os, -1.0f, 1.0f);
+                cd[i] = clampf((pcd - ob) * os, -1.0f, 1.0f);
+                ms[i] = clampf((sum - ob) * os, -1.0f, 1.0f);
+            }
         }
         {
-            float pab = aA * aB, pcd = aC * aD;
+            float pab = aA * aB, pcd = aC * aD, ob, os;
             float sum = (afl & 4) ? (mux_cd ? pcd : pab) : pab + pcd;
-            aab = clampf(map_out(pab, afl & 0x38), -1.0f, 1.0f);
-            acd = clampf(map_out(pcd, afl & 0x38), -1.0f, 1.0f);
-            ams = clampf(map_out(sum, afl & 0x38), -1.0f, 1.0f);
+            out_map(afl & 0x38, &ob, &os);
+            aab = clampf((pab - ob) * os, -1.0f, 1.0f);
+            acd = clampf((pcd - ob) * os, -1.0f, 1.0f);
+            ams = clampf((sum - ob) * os, -1.0f, 1.0f);
         }
 
         /* RGB destinations; blue-to-alpha also writes the destination's .a. */

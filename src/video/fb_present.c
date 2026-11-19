@@ -50,6 +50,7 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * thread is never reading the one being filled. */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+static int fb_write_bmp(const char *path, const uint32_t *rgb);
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -80,8 +81,22 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     const uint8_t *src;
     LONG next;
     uint32_t bpp, x, y;
+    static int dump_init;
+    static const char *dump_path;
+    static unsigned dump_every = 60, dump_frames;
 
-    if (!s_fb_running || !fb_va || !pitch)
+    /* Optional capture of exactly the completed, converted frame the window
+     * receives. Executor report dumps can land halfway through a frame or on
+     * a temporary render target. This also works without creating a window.
+     * Settings are sampled once, avoiding getenv in the normal pixel path. */
+    if (!dump_init) {
+        const char *every = getenv("RECOMP_FB_PRESENT_DUMP_EVERY");
+        dump_path = getenv("RECOMP_FB_PRESENT_DUMP");
+        if (every && atoi(every) > 0)
+            dump_every = (unsigned)atoi(every);
+        dump_init = 1;
+    }
+    if ((!s_fb_running && !dump_path) || !fb_va || !pitch)
         return;
     if (getenv("RECOMP_FB_VA"))
         return;                       /* pinned: leave the old path alone */
@@ -121,6 +136,11 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     }
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
+    if (dump_path && ++dump_frames % dump_every == 0) {
+        if (fb_write_bmp(dump_path, s_present[next]) == 0)
+            fprintf(stderr, "  [FBPRESENT] wrote %s (%ux%u, pitch %u, AA y %u)\n",
+                    dump_path, s_fb_width, s_fb_height, pitch, s_fb_aa_sy);
+    }
 }
 
 /* Title bar, the way ps3recomp's window shows it. Written by the flip,
@@ -229,14 +249,14 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
  * A black window is ambiguous: it means either that the read path is wrong or
  * that the title really did render black. Dumping the same converted pixels
  * the window draws settles which, and does it without a screenshot. */
-int xbox_FramebufferDumpBmp(const char *path)
+static int fb_write_bmp(const char *path, const uint32_t *rgb)
 {
     FILE *f;
     uint32_t row = ((s_fb_width * 3u) + 3u) & ~3u;
     uint32_t img = row * s_fb_height, total = 54u + img, y, x;
     uint8_t hdr[54], *line;
 
-    if (!s_rgb || !s_fb_va)
+    if (!rgb)
         return -1;
     f = fopen(path, "wb");
     if (!f)
@@ -249,20 +269,37 @@ int xbox_FramebufferDumpBmp(const char *path)
     memcpy(hdr + 22, &s_fb_height, 4);
     hdr[26] = 1; hdr[28] = 24;
     memcpy(hdr + 34, &img, 4);
-    fwrite(hdr, 1, sizeof(hdr), f);
+    if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        fclose(f);
+        return -1;
+    }
 
     line = (uint8_t *)calloc(1, row);
+    if (!line) {
+        fclose(f);
+        return -1;
+    }
     for (y = 0; y < s_fb_height; y++) {
-        const uint32_t *src = s_rgb + (size_t)(s_fb_height - 1 - y) * s_fb_width;
+        const uint32_t *src = rgb + (size_t)(s_fb_height - 1 - y) * s_fb_width;
         for (x = 0; x < s_fb_width; x++) {
             line[x * 3 + 0] = (uint8_t)(src[x] & 0xFF);
             line[x * 3 + 1] = (uint8_t)((src[x] >> 8) & 0xFF);
             line[x * 3 + 2] = (uint8_t)((src[x] >> 16) & 0xFF);
         }
-        fwrite(line, 1, row, f);
+        if (fwrite(line, 1, row, f) != row) {
+            free(line);
+            fclose(f);
+            return -1;
+        }
     }
     free(line);
-    fclose(f);
+    return fclose(f) == 0 ? 0 : -1;
+}
+
+int xbox_FramebufferDumpBmp(const char *path)
+{
+    if (!s_fb_va || fb_write_bmp(path, s_rgb) != 0)
+        return -1;
     fprintf(stderr, "  [FBWIN] wrote %s (%ux%u from 0x%08X)\n",
             path, s_fb_width, s_fb_height, s_fb_va);
     return 0;

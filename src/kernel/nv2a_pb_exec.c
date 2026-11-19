@@ -265,6 +265,12 @@ typedef struct {
     int      valid;
 } Texture;
 
+typedef struct { uint64_t pixels; uint32_t pixel_max; } PixelStats;
+/* Workers accumulate diagnostics privately; the executor merges at a drain.
+ * Updating s_gpu.pixels from every row owner was both a race and a shared
+ * cache-line write on every pixel. Non-worker paths still update s_gpu. */
+static NV_TLS PixelStats *t_pixel_stats;
+
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
@@ -749,6 +755,7 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2]);
 static void pipe_drain(void);
+static void pipe_drain_exec(void);
 
 /* The surface rectangle in real pixels.
  *
@@ -1051,8 +1058,14 @@ static uint32_t wrap_coord(uint32_t c, uint32_t size, uint32_t mode)
     int32_t sc = (int32_t)c, n = (int32_t)size;
     if (!size)
         return 0;
-    if (mode == 1)                         /* wrap */
+    if (mode == 1) {                       /* wrap */
+        /* Power-of-two sizes (nearly every texture) wrap with a mask, which
+         * gives the same texel for negative coordinates too; the two
+         * divisions below ran eight times per bilinear pixel. */
+        if (!(size & (size - 1)))
+            return c & (size - 1);
         return (uint32_t)(((sc % n) + n) % n);
+    }
     return sc < 0 ? 0u : (sc >= n ? size - 1 : c);   /* clamp, and the rest */
 }
 
@@ -1394,9 +1407,15 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         return;
     if (y < (int)RS.clip_y || y >= (int)(RS.clip_y + RS.clip_h))
         return;
-    s_gpu.pixels++;
-    if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
-        s_gpu.pixel_max = argb;
+    if (t_pixel_stats) {
+        t_pixel_stats->pixels++;
+        if ((argb & 0x00FFFFFFu) > (t_pixel_stats->pixel_max & 0x00FFFFFFu))
+            t_pixel_stats->pixel_max = argb;
+    } else {
+        s_gpu.pixels++;
+        if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
+            s_gpu.pixel_max = argb;
+    }
     row = RS.surface + (size_t)y * RS.pitch;
 
     /* Blending, with the GL factor set and equations the NV2A takes.
@@ -1475,7 +1494,7 @@ static void raster_triangle(const float a[2], const float b[2],
     int minx, maxx, miny, maxy, x, y;
     int textured = uv && RS.texs[0].valid;
 
-    pipe_drain();                          /* drawn here, after the jobs before */
+    pipe_drain_exec();                     /* drawn here, after the jobs before */
     if (bpp != 4 && bpp != 2)
         return;
 
@@ -2060,6 +2079,8 @@ static float *zbuf_current(int create)
     if (!create)
         return NULL;
     i = s_zbuf_next++ & 3;
+    if (s_zbufs[i].z)
+        pipe_drain();       /* a job in flight may still test against it */
     if (!s_zbufs[i].z)
         s_zbufs[i].z = (float *)malloc(sizeof(float) * NV_ZBUF_W * NV_ZBUF_H);
     if (!s_zbufs[i].z)
@@ -2149,6 +2170,88 @@ static uint32_t tex_face_stride(const Texture *t)
 /* One texel at normalised (swizzled/DXT) or texel (linear) coordinates, as
  * floats. An unusable stage reads white, so a missing texture multiplies
  * through instead of blacking the pixel out. */
+/* n / 255.0f, the values nv2a_rc_unpack gives, local so it inlines. */
+static float s_texel_unorm[256];
+
+static void texel_unpack(uint32_t c, float o[4])
+{
+    if (s_texel_unorm[255] == 0.0f) {          /* first use; idempotent */
+        int i;
+        for (i = 0; i < 256; i++)
+            s_texel_unorm[i] = (float)i / 255.0f;
+    }
+    o[0] = s_texel_unorm[(c >> 16) & 0xFF];
+    o[1] = s_texel_unorm[(c >>  8) & 0xFF];
+    o[2] = s_texel_unorm[ c        & 0xFF];
+    o[3] = s_texel_unorm[ c >> 24        ];
+}
+
+/* The four texels of a bilinear tap, (iu, iv) to (iu + 1, iv + 1), in the
+ * order rc_texel blends them -- for the swizzled formats a scene is made of
+ * (paletted P8, A8R8G8B8, X8R8G8B8). Four sample_tex calls decided the format,
+ * checked for DXT and wrapped both coordinates once per texel; here that is
+ * done once per tap and each axis wraps twice. Same texels as sample_tex,
+ * bit for bit. Returns 0 for anything else, and the caller falls back. */
+static int sample_quad(const Texture *t, uint32_t face_offset, int32_t iu,
+                       int32_t iv, uint32_t texel[4])
+{
+    const uint8_t *p;
+    uint32_t us[2], vs[2], fmt = t->color, k;
+
+    if (!t->valid || (fmt != 0x0B && fmt != 0x06 && fmt != 0x07))
+        return 0;
+    if (fmt == 0x0B && !t->palette)
+        return 0;
+    us[0] = wrap_coord((uint32_t)iu, t->width, t->addr_u);
+    us[1] = wrap_coord((uint32_t)(iu + 1), t->width, t->addr_u);
+    vs[0] = wrap_coord((uint32_t)iv, t->height, t->addr_v);
+    vs[1] = wrap_coord((uint32_t)(iv + 1), t->height, t->addr_v);
+    p = (const uint8_t *)xbox_GetMemoryOffset() + t->offset + face_offset;
+    {
+        /* For power-of-two sizes a Morton offset is an X part OR'd with a Y
+         * part (swizzle_offset's own fast path, split by axis), so two of
+         * each serve all four texels. Other sizes take swizzle_offset. */
+        uint32_t w = t->width, h = t->height, ox[2], oy[2], pow2;
+        pow2 = w && h && w <= 0x10000u && h <= 0x10000u
+            && !(w & (w - 1u)) && !(h & (h - 1u));
+        if (pow2) {
+            uint32_t minor = w < h ? w : h, low = minor - 1u, shift = 0, a;
+            while ((minor >> shift) > 1u)
+                shift++;
+            for (a = 0; a < 2; a++) {
+                uint32_t x = us[a] & (w - 1u), y = vs[a] & (h - 1u);
+                ox[a] = swizzle_spread(x & low)
+                      | (w > h ? (x & ~low) << shift : 0u);
+                oy[a] = (swizzle_spread(y & low) << 1)
+                      | (w > h ? 0u : (y & ~low) << shift);
+            }
+        }
+        for (k = 0; k < 4; k++) {
+            uint32_t i = pow2 ? (ox[k & 1] | oy[k >> 1])
+                              : swizzle_offset(us[k & 1], vs[k >> 1], w, h);
+        if (fmt == 0x0B)
+            texel[k] = ((const uint32_t *)((const uint8_t *)xbox_GetMemoryOffset()
+                                           + t->palette))[p[i]];
+        else if (fmt == 0x06)
+            texel[k] = ((const uint32_t *)p)[i];
+        else
+            texel[k] = ((const uint32_t *)p)[i] | 0xFF000000u;
+        }
+    }
+    return 1;
+}
+
+/* (int32_t)floorf(f) without the library call: truncate, then step down
+ * for negative non-integers. Where the cast saturates (NaN, |f| >= 2^31) it
+ * leaves the same INT32_MIN the original expression produced on x86. */
+static int32_t floor_i32(float f)
+{
+    int32_t i = (int32_t)f;
+    if (i != INT32_MIN && (float)i > f)
+        i--;
+    return i;
+}
+
 static void rc_texel(const Texture *t, uint32_t face, float u, float v,
                      float out[4])
 {
@@ -2165,15 +2268,23 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
      * Add LOD from the screen-space derivative when that shows. */
     if (mag == 2 || min == 2 || min == 4 || min == 6) {
         float fu = u - 0.5f, fv = v - 0.5f, wu, wv, c[4][4];
-        int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv), k, j;
+        int32_t iu = floor_i32(fu), iv = floor_i32(fv), k, j;
         wu = fu - (float)iu;
         wv = fv - (float)iv;
-        for (k = 0; k < 4; k++) {
-            if (sample_tex(t, face, (uint32_t)(iu + (k & 1)),
-                           (uint32_t)(iv + (k >> 1)), &texel))
-                nv2a_rc_unpack(texel, c[k]);
-            else
-                c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
+        {
+            uint32_t q[4];
+            if (sample_quad(t, face, iu, iv, q)) {
+                for (k = 0; k < 4; k++)
+                    texel_unpack(q[k], c[k]);
+            } else {
+                for (k = 0; k < 4; k++) {
+                    if (sample_tex(t, face, (uint32_t)(iu + (k & 1)),
+                                   (uint32_t)(iv + (k >> 1)), &texel))
+                        nv2a_rc_unpack(texel, c[k]);
+                    else
+                        c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
+                }
+            }
         }
         for (j = 0; j < 4; j++)
             out[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
@@ -2415,11 +2526,54 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  * RECOMP_RASTER_THREADS=<n> sets the worker count (1 = none: the executor
  * draws each batch itself); the default leaves a few cores for the title and
  * the host.
- * ponytail: s_gpu.pixels/pixel_max in put_pixel are unsynchronised stats and
- * may undercount; nothing depends on them. The job counters are 32-bit and
+ * Pixel statistics are private to each worker and merged after a drain.
+ * The job counters are 32-bit and
  * wrap after about four days of continuous drawing. */
-#define NV_RASTER_MAX_THREADS 16
-#define NV_PIPE_JOBS 8
+/* Up to 32 workers with RECOMP_RASTER_THREADS. The default is cores - 4,
+ * at most NV_RASTER_DEFAULT_MAX: on a 16-core / 32-thread Ryzen 9 5900XT,
+ * Fallout: BoS measured 33.5 / 30.6 FPS with 16 workers, 37.0 / 37.8 with
+ * 24 and 32.5 / 38.4 with 28 (28 stalls at times: it leaves too few
+ * threads for the title, the executor and audio). */
+#define NV_RASTER_MAX_THREADS 32
+#define NV_RASTER_DEFAULT_MAX 24
+/* Jobs in flight between the executor and the slowest worker. The executor
+ * stalls when the ring is full, and a level is hundreds of small batches a
+ * frame, so the ring size is a knob: RECOMP_PIPE_JOBS=<2..64>, default 32
+ * (measured on Fallout: BoS against 8 and 64: 26.0 / 26.4 / 26.5 FPS).
+ * It changes only how far the executor may run ahead; every drain stays
+ * where it is, and each row still sees its triangles in order. */
+#define NV_PIPE_JOBS_MAX 64
+static int s_pipe_jobs = 32;
+
+/* Where the executor waits on the workers, for the [PIPE] report line.
+ * Times are QueryPerformanceCounter ticks; Windows builds only. */
+static struct {
+    uint64_t ring_ticks, drain_ticks;
+    uint32_t jobs, tris, ring_waits, drains;
+    uint32_t drain_scan, drain_method, drain_exec, drain_report, drain_hazard;
+    uint32_t method_subch, method_low, method_report, method_semclear;
+    /* Which methods drain: subchannel << 16 | method, with counts. */
+    uint32_t why_key[32], why_n[32];
+} s_pstat;
+
+/* Surfaces the published, undrained jobs draw into: guest byte ranges with
+ * their pitch. pipe_drain empties it. */
+static struct { uint32_t base, end, pitch; } s_written[16];
+static int s_nwritten;
+
+static void pipe_note_why(uint32_t subch, uint32_t method)
+{
+    uint32_t key = subch << 16 | method, i;
+    for (i = 0; i < 32 && s_pstat.why_n[i]; i++)
+        if (s_pstat.why_key[i] == key) {
+            s_pstat.why_n[i]++;
+            return;
+        }
+    if (i < 32) {
+        s_pstat.why_key[i] = key;
+        s_pstat.why_n[i] = 1;
+    }
+}
 /* How long a worker with nothing to do spins for the next job before it
  * sleeps; most jobs follow well within that. */
 #define NV_RASTER_SPIN 4000
@@ -2441,13 +2595,29 @@ typedef LONG pipe_count;
 #else
 typedef long pipe_count;
 #endif
+
+/* Each worker writes its counters for every shaded/depth-tested pixel. Keep
+ * them off its neighbours' cache lines: the old 24-byte counter array made
+ * independent rows contend for the same lines on multicore CPUs. The tail
+ * belongs to the same worker and must also stay clear of the producer head. */
+#if defined(_MSC_VER)
+#define NV_WORKER_ALIGN __declspec(align(64))
+#else
+#define NV_WORKER_ALIGN __attribute__((aligned(64)))
+#endif
+typedef struct NV_WORKER_ALIGN {
+    volatile pipe_count tail;
+    XfCount cnt;
+    PixelStats pixels;
+    uint64_t idle_ticks;       /* waiting for a job; read by the report */
+} RasterWorker;
+
 static struct {
     int n;                                      /* workers; 0 = the executor draws */
-    RasterJob job[NV_PIPE_JOBS];
+    RasterJob job[NV_PIPE_JOBS_MAX];
     volatile pipe_count head;                   /* jobs published */
     pipe_count drained;                         /* head at the last drain */
-    volatile pipe_count tail[NV_RASTER_MAX_THREADS];  /* jobs worker k has drawn */
-    XfCount cnt[NV_RASTER_MAX_THREADS];         /* worker k's counts, since the drain */
+    RasterWorker worker[NV_RASTER_MAX_THREADS];  /* one cache line per worker */
 } s_pipe;
 static int s_xfq_n;                             /* triangles in the job being filled */
 
@@ -2469,20 +2639,25 @@ static DWORD WINAPI raster_worker(LPVOID arg)
 {
     int k = (int)(intptr_t)arg;
     LONG j = 0;
+    t_pixel_stats = &s_pipe.worker[k].pixels;
     for (;;) {
         RasterJob *J;
         int spins = 0;
+        LARGE_INTEGER w0, w1;
+        QueryPerformanceCounter(&w0);
         while (s_pipe.head == j) {
             if (++spins < NV_RASTER_SPIN)
                 YieldProcessor();
             else
                 WaitOnAddress(&s_pipe.head, &j, sizeof j, INFINITE);
         }
-        J = &s_pipe.job[j % NV_PIPE_JOBS];
+        QueryPerformanceCounter(&w1);
+        s_pipe.worker[k].idle_ticks += (uint64_t)(w1.QuadPart - w0.QuadPart);
+        J = &s_pipe.job[j % s_pipe_jobs];
         t_rs = &J->rs;
-        xf_rows_owned(J->q, J->n, k, s_pipe.n, &s_pipe.cnt[k]);
-        InterlockedExchange(&s_pipe.tail[k], ++j);
-        WakeByAddressAll((PVOID)&s_pipe.tail[k]);   /* free when nobody waits */
+        xf_rows_owned(J->q, J->n, k, s_pipe.n, &s_pipe.worker[k].cnt);
+        InterlockedExchange(&s_pipe.worker[k].tail, ++j);
+        WakeByAddressAll((PVOID)&s_pipe.worker[k].tail);   /* free when nobody waits */
     }
     return 0;
 }
@@ -2497,9 +2672,17 @@ static void pipe_start(void)
     if (init)
         return;
     init = 1;
+    e = getenv("RECOMP_PIPE_JOBS");
+    if (e) {
+        int jobs = atoi(e);
+        s_pipe_jobs = jobs < 2 ? 2 : (jobs > NV_PIPE_JOBS_MAX ? NV_PIPE_JOBS_MAX : jobs);
+    }
+    fprintf(stderr, "[PIPE] ring of %d jobs\n", s_pipe_jobs);
     e = getenv("RECOMP_RASTER_THREADS");
     GetSystemInfo(&si);
     n = e ? atoi(e) : (int)si.dwNumberOfProcessors - 4;
+    if (!e && n > NV_RASTER_DEFAULT_MAX)
+        n = NV_RASTER_DEFAULT_MAX;
     if (n > NV_RASTER_MAX_THREADS)
         n = NV_RASTER_MAX_THREADS;
     if (n <= 1)
@@ -2517,11 +2700,11 @@ static void pipe_wait(LONG upto)
     for (k = 0; k < s_pipe.n; k++) {
         int spins = 0;
         LONG t;
-        while ((t = s_pipe.tail[k]) < upto) {
+        while ((t = s_pipe.worker[k].tail) < upto) {
             if (++spins < NV_RASTER_SPIN)
                 YieldProcessor();
             else
-                WaitOnAddress(&s_pipe.tail[k], &t, sizeof t, INFINITE);
+                WaitOnAddress(&s_pipe.worker[k].tail, &t, sizeof t, INFINITE);
         }
     }
 }
@@ -2537,14 +2720,115 @@ static void pipe_drain(void)
 
     if (s_pipe.head == s_pipe.drained)
         return;
+#if defined(_WIN32)
+    {
+        LARGE_INTEGER w0, w1;
+        QueryPerformanceCounter(&w0);
+        pipe_wait(s_pipe.head);
+        QueryPerformanceCounter(&w1);
+        s_pstat.drain_ticks += (uint64_t)(w1.QuadPart - w0.QuadPart);
+        s_pstat.drains++;
+    }
+#else
     pipe_wait(s_pipe.head);
+#endif
     for (k = 0; k < s_pipe.n; k++) {
-        s_gpu.xf_depth_fail += s_pipe.cnt[k].depth_fail;
-        s_gpu.xf_pixels += s_pipe.cnt[k].pixels;
-        s_gpu.zpass_count += s_pipe.cnt[k].zpass;
-        memset(&s_pipe.cnt[k], 0, sizeof s_pipe.cnt[k]);
+        s_gpu.xf_depth_fail += s_pipe.worker[k].cnt.depth_fail;
+        s_gpu.xf_pixels += s_pipe.worker[k].cnt.pixels;
+        s_gpu.zpass_count += s_pipe.worker[k].cnt.zpass;
+        memset(&s_pipe.worker[k].cnt, 0, sizeof s_pipe.worker[k].cnt);
+        s_gpu.pixels += s_pipe.worker[k].pixels.pixels;
+        if ((s_pipe.worker[k].pixels.pixel_max & 0x00FFFFFFu)
+                > (s_gpu.pixel_max & 0x00FFFFFFu))
+            s_gpu.pixel_max = s_pipe.worker[k].pixels.pixel_max;
+        memset(&s_pipe.worker[k].pixels, 0, sizeof s_pipe.worker[k].pixels);
     }
     s_pipe.drained = s_pipe.head;
+    s_nwritten = 0;
+}
+
+/* RECOMP_SURFACE_DRAIN: unset or 1 = drain on every surface method (the
+ * default); 0 = hazard tracking instead; unsafe = neither, for showing what
+ * the tracking prevents (tests only). Tracking is correct (see
+ * tests/nv2a_surface_hazard) but measured no faster on Fallout: BoS -- the
+ * waiting moved to the KickOff drain -- so it is opt-in. */
+static int pipe_surface_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_SURFACE_DRAIN");
+        mode = !e ? 1 : (strcmp(e, "unsafe") == 0 ? 2 : (atoi(e) ? 1 : 0));
+    }
+    return mode;
+}
+
+static int ranges_overlap(uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1)
+{
+    return a0 < b1 && b0 < a1;
+}
+
+/* Bytes a texture may read, generously: every mip level of a swizzled or
+ * compressed image fits in twice its top level at four bytes a texel. */
+static uint32_t tex_span(const Texture *t)
+{
+    uint32_t faces = t->cube ? 6u : 1u;
+    if (tex_size_from_format(t->color))
+        return t->width * t->height * 4u * 2u * faces;
+    return t->pitch * t->height * faces;
+}
+
+/* Before a job is published: drain if it reads a surface an earlier job may
+ * still be drawing, or draws over one laid out differently; then note its
+ * own surface. Executor thread only. */
+static void pipe_check_hazards(const RasterState *rs)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t sb, se;
+    int i, st, hazard = 0;
+
+    if (pipe_surface_mode() != 0 || !rs->surface)
+        return;
+    sb = (uint32_t)(rs->surface - mem);
+    se = sb + (rs->clip_y + rs->clip_h) * rs->pitch;
+    for (st = 0; st < 4 && !hazard; st++) {
+        const Texture *t = &rs->texs[st];
+        if (!t->valid)
+            continue;
+        for (i = 0; i < s_nwritten; i++) {
+            if (ranges_overlap(t->offset, t->offset + tex_span(t),
+                               s_written[i].base, s_written[i].end)
+                || (t->palette && ranges_overlap(t->palette, t->palette + 1024u,
+                                                 s_written[i].base,
+                                                 s_written[i].end)))
+                hazard = 1;
+        }
+    }
+    for (i = 0; i < s_nwritten && !hazard; i++)
+        if (ranges_overlap(sb, se, s_written[i].base, s_written[i].end)
+            && (s_written[i].base != sb || s_written[i].pitch != rs->pitch))
+            hazard = 1;
+    if (hazard || s_nwritten == 16) {
+        s_pstat.drain_hazard++;
+        pipe_drain();                       /* empties s_written */
+    }
+    for (i = 0; i < s_nwritten; i++)
+        if (s_written[i].base == sb && s_written[i].pitch == rs->pitch) {
+            if (se > s_written[i].end)
+                s_written[i].end = se;
+            return;
+        }
+    s_written[s_nwritten].base = sb;
+    s_written[s_nwritten].end = se;
+    s_written[s_nwritten].pitch = rs->pitch;
+    s_nwritten++;
+}
+
+/* pipe_drain for the paths that draw on the executor, counted apart. */
+static void pipe_drain_exec(void)
+{
+    if (s_pipe.head != s_pipe.drained)
+        s_pstat.drain_exec++;
+    pipe_drain();
 }
 
 /* Methods that touch what the workers draw, or tell the title how far the
@@ -2554,6 +2838,15 @@ static int pipe_method_syncs(uint32_t subch, uint32_t method)
 {
     if (subch != 0)
         return 1;                       /* other classes, the kickoff latch */
+    /* Surface setup (clip, format, pitch, colour and zeta offset) only
+     * changes state each job copies, and a worker owns the same rows of
+     * every surface, so switching surfaces needs no drain by itself. What
+     * does -- a job sampling a surface still being drawn, or a surface laid
+     * over another one differently -- is caught per job by
+     * pipe_check_hazards. Only with RECOMP_SURFACE_DRAIN=0; the default
+     * still drains here. */
+    if (method >= 0x0200 && method <= 0x0214 && pipe_surface_mode() != 1)
+        return 0;
     return method < 0x0220              /* NOP/notify, flips, surfaces, zeta */
         || (method >= 0x17C8 && method <= 0x17D0)   /* reports */
         || (method >= 0x1D6C && method <= 0x1D9C);  /* semaphore, clears */
@@ -2561,15 +2854,18 @@ static int pipe_method_syncs(uint32_t subch, uint32_t method)
 
 static void xf_queue_flush(void)
 {
-    RasterJob *J = &s_pipe.job[s_pipe.head % NV_PIPE_JOBS];
+    RasterJob *J = &s_pipe.job[s_pipe.head % s_pipe_jobs];
 
     if (!s_xfq_n)
         return;
+    s_pstat.jobs++;
+    s_pstat.tris += (uint32_t)s_xfq_n;
     J->n = s_xfq_n;
     s_xfq_n = 0;
 #if defined(_WIN32)
     if (s_pipe.n) {
         J->rs = s_rs_live;
+        pipe_check_hazards(&J->rs);
         InterlockedIncrement(&s_pipe.head);   /* full barrier: job, then head */
         WakeByAddressAll((PVOID)&s_pipe.head);
         return;
@@ -2586,14 +2882,32 @@ static void xf_queue_flush(void)
 
 static void xf_queue_push(const XfTri *T)
 {
-    RasterJob *J = &s_pipe.job[s_pipe.head % NV_PIPE_JOBS];
+    RasterJob *J;
     XfQueued *q;
 
+    pipe_start();                               /* sets the ring size first */
+    J = &s_pipe.job[s_pipe.head % s_pipe_jobs];
     if (!s_xfq_n) {
-        /* A fresh job reuses slot head; job head - NV_PIPE_JOBS used it
+        /* A fresh job reuses slot head; job head - s_pipe_jobs used it
          * last and every worker has to be done with that one. */
-        pipe_start();
-        pipe_wait(s_pipe.head - NV_PIPE_JOBS + 1);
+#if defined(_WIN32)
+        if (s_pipe.n && (LONG)(s_pipe.head - s_pipe_jobs + 1) > 0) {
+            int k, full = 0;
+            for (k = 0; k < s_pipe.n; k++)
+                if (s_pipe.worker[k].tail < (LONG)(s_pipe.head - s_pipe_jobs + 1))
+                    full = 1;
+            if (full) {
+                LARGE_INTEGER w0, w1;
+                QueryPerformanceCounter(&w0);
+                pipe_wait(s_pipe.head - s_pipe_jobs + 1);
+                QueryPerformanceCounter(&w1);
+                s_pstat.ring_ticks += (uint64_t)(w1.QuadPart - w0.QuadPart);
+                s_pstat.ring_waits++;
+            }
+        }
+#else
+        pipe_wait(s_pipe.head - s_pipe_jobs + 1);
+#endif
         if (!J->q)
             J->q = (XfQueued *)malloc(XF_QUEUE_MAX * sizeof *J->q);
         if (!J->q) {                            /* out of memory: draw it now */
@@ -2617,6 +2931,8 @@ static void xf_queue_push(const XfTri *T)
 void nv2a_pb_exec_sync(void)
 {
     xf_queue_flush();
+    if (s_pipe.head != s_pipe.drained)
+        s_pstat.drain_scan++;
     pipe_drain();
 }
 
@@ -2736,10 +3052,21 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
  * space first: clip = (screen - offset) / scale * w. Everything else the
  * vertex carries -- colours, fog, texture coordinates -- is linear in clip
  * space and is interpolated directly. The polygon is clipped against
- * w = NV_CLIP_W (Sutherland-Hodgman, one plane), re-projected, and fanned.
- * ponytail: the near plane only; x/y/far fall to the rasteriser's bounds
- * check, which is correct, just slower for huge off-screen triangles. */
+ * w = NV_CLIP_W (Sutherland-Hodgman), re-projected, and fanned.
+ *
+ * Then the guard band. A vertex just in front of the eye projects to screen
+ * coordinates of 1e7..1e17, and the rasteriser's edge functions are float:
+ * at that size a pixel centre is below one ulp of the vertex coordinate, so
+ * a partly visible triangle comes out with noise for coverage, colour and
+ * depth -- shards across the frame, and wrong depth that lets nearby
+ * geometry cover the player. Like the hardware, the clipper therefore also
+ * cuts the polygon to a band NV_GUARD pixels around the clip rectangle. The
+ * planes are linear in clip space ((sx - L) * w = cx * k + (o - L) * w for
+ * the left one), so attributes interpolate exactly as for the near plane.
+ * A triangle already inside the band takes the old path untouched. The far
+ * plane is still the rasteriser's business. */
 #define NV_CLIP_W 1e-3f
+#define NV_GUARD  1024.0f
 
 /* The screen-space transform of the current batch, for taking vertices back
  * to clip space: screen = clip.xyz / w * k + o. A program's is the viewport
@@ -2766,15 +3093,48 @@ static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
         po[i] = pa[i] + (pb[i] - pa[i]) * t;
 }
 
+/* One Sutherland-Hodgman pass over a clip-space polygon: keeps the part where
+ * ax * x + ay * y + aw * w + a0 >= 0. Returns the new vertex count (at most
+ * n + 1). */
+static int xf_clip_plane(const Nv2aVshOutput *in, int n, Nv2aVshOutput *out,
+                         float ax, float ay, float aw, float a0)
+{
+    int i, m = 0;
+
+    for (i = 0; i < n; i++) {
+        const Nv2aVshOutput *p = &in[i], *q = &in[(i + 1) % n];
+        float dp = ax * p->pos[0] + ay * p->pos[1] + aw * p->pos[3] + a0;
+        float dq = ax * q->pos[0] + ay * q->pos[1] + aw * q->pos[3] + a0;
+        if (dp >= 0.0f)
+            out[m++] = *p;
+        if ((dp >= 0.0f) != (dq >= 0.0f))
+            xf_lerp(p, q, dp / (dp - dq), &out[m++]);
+    }
+    return m;
+}
+
+/* Inside the guard band (and so safe for the float rasteriser)? NaN is not. */
+static int xf_in_band(const Nv2aVshOutput *v, float l, float t, float r, float b)
+{
+    return v->pos[3] > NV_CLIP_W
+        && v->pos[0] >= l && v->pos[0] <= r
+        && v->pos[1] >= t && v->pos[1] <= b;
+}
+
 static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
                               const Nv2aVshOutput *c)
 {
+    /* 3 vertices, plus at most one per plane (near and four guard). */
+    Nv2aVshOutput p0[8], p1[8];
     const Nv2aVshOutput *in[3];
-    Nv2aVshOutput poly[4], va, vb;
-    float k[3], o[3], ca[3], cb[3];
-    int n = 0, i, j;
+    float k[3], o[3], cc[3];
+    float gl = (float)RS.clip_x - NV_GUARD, gt = (float)RS.clip_y - NV_GUARD;
+    float gr = (float)(RS.clip_x + RS.clip_w) + NV_GUARD;
+    float gb = (float)(RS.clip_y + RS.clip_h) + NV_GUARD;
+    int n = 3, i, j;
 
-    if (a->pos[3] > NV_CLIP_W && b->pos[3] > NV_CLIP_W && c->pos[3] > NV_CLIP_W) {
+    if (xf_in_band(a, gl, gt, gr, gb) && xf_in_band(b, gl, gt, gr, gb)
+        && xf_in_band(c, gl, gt, gr, gb)) {
         raster_xf_triangle(a, b, c);
         return;
     }
@@ -2785,30 +3145,38 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     }
     for (i = 0; i < 3; i++) { k[i] = s_xf_k[i]; o[i] = s_xf_o[i]; }
     in[0] = a; in[1] = b; in[2] = c;
-    for (i = 0; i < 3; i++) {
-        const Nv2aVshOutput *p = in[i], *q = in[(i + 1) % 3];
-        int pin = p->pos[3] > NV_CLIP_W, qin = q->pos[3] > NV_CLIP_W;
-        if (pin) {
-            va = *p;
-            xf_to_clip(p, k, o, ca);
-            for (j = 0; j < 3; j++) va.pos[j] = ca[j];
-            poly[n++] = va;
-        }
-        if (pin != qin) {
-            float t = (NV_CLIP_W - p->pos[3]) / (q->pos[3] - p->pos[3]);
-            va = *p; vb = *q;
-            xf_to_clip(p, k, o, ca);
-            xf_to_clip(q, k, o, cb);
-            for (j = 0; j < 3; j++) { va.pos[j] = ca[j]; vb.pos[j] = cb[j]; }
-            xf_lerp(&va, &vb, t, &poly[n++]);
-        }
+    for (i = 0; i < 3; i++) {                 /* back to clip space */
+        p0[i] = *in[i];
+        xf_to_clip(in[i], k, o, cc);
+        for (j = 0; j < 3; j++)
+            p0[i].pos[j] = cc[j];
+    }
+    n = xf_clip_plane(p0, n, p1, 0.0f, 0.0f, 1.0f, -NV_CLIP_W);   /* near */
+    if (n < 3) {
+        s_gpu.tris_behind++;
+        return;
+    }
+    /* w > 0 from here on, so (sx - edge) * w is the signed distance. A zero
+     * scale left the coordinate at the offset (xf_to_clip); no plane then. */
+    if (k[0] != 0.0f) {
+        n = xf_clip_plane(p1, n, p0,  k[0], 0.0f, o[0] - gl, 0.0f);
+        n = xf_clip_plane(p0, n, p1, -k[0], 0.0f, gr - o[0], 0.0f);
+    }
+    if (k[1] != 0.0f && n >= 3) {
+        n = xf_clip_plane(p1, n, p0, 0.0f,  k[1], o[1] - gt, 0.0f);
+        n = xf_clip_plane(p0, n, p1, 0.0f, -k[1], gb - o[1], 0.0f);
+    }
+    if (n < 3) {
+        s_gpu.tris_skipped_offscreen++;
+        s_gpu.xf_offscreen++;
+        return;
     }
     /* Back to screen space: divide by the (now positive) w, viewport. */
     for (i = 0; i < n; i++)
         for (j = 0; j < 3; j++)
-            poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3] * k[j] + o[j];
+            p1[i].pos[j] = p1[i].pos[j] / p1[i].pos[3] * k[j] + o[j];
     for (i = 1; i + 1 < n; i++)
-        raster_xf_triangle(&poly[0], &poly[i], &poly[i + 1]);
+        raster_xf_triangle(&p1[0], &p1[i], &p1[i + 1]);
 }
 
 /* About 7 MB, so allocated by the first batch that transforms rather than
@@ -2870,15 +3238,48 @@ static void xf_set_viewport(void)
     s_xf_o[2] = of[2];
 }
 
+/* Post-transform cache for one batch. Indexed meshes name each vertex
+ * several times; transforming it again gives the same result -- the
+ * program starts from cleared registers, and within a batch its inputs
+ * (attributes in guest memory, constants, the program) do not change --
+ * unless the program may write c[] (CXT_WRITE_EN), when the cache is off.
+ * Direct-mapped by index; a collision just transforms again. */
+#define XF_VCACHE 4096
+static struct { uint32_t index, pos, gen; } s_vcache[XF_VCACHE];
+static uint32_t s_vcache_gen;
+static uint32_t s_vcache_hits, s_vcache_runs;      /* for the [PIPE] report */
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
+    static int off = -1;
+    int cache;
+
+    if (off < 0)
+        off = getenv("RECOMP_NO_VCACHE") != NULL;      /* for A/B and tests */
+    cache = !off && !nv2a_vsh_cxt_write_enabled();
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
-    for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+    if (++s_vcache_gen == 0) {                         /* wrapped: forget all */
+        memset(s_vcache, 0, sizeof s_vcache);
+        s_vcache_gen = 1;
+    }
+    for (i = 0; i < n; i++) {
+        uint32_t idx = s_gpu.idx[i], slot = (idx ^ (idx >> 12)) & (XF_VCACHE - 1);
+        if (cache && s_vcache[slot].gen == s_vcache_gen
+            && s_vcache[slot].index == idx) {
+            s_xf[i] = s_xf[s_vcache[slot].pos];
+            s_vcache_hits++;
+            continue;
+        }
+        if (!transform_vertex(idx, &s_xf[i]))
             return;                                    /* no program loaded */
+        s_vcache_runs++;
+        s_vcache[slot].index = idx;
+        s_vcache[slot].pos = i;
+        s_vcache[slot].gen = s_vcache_gen;
+    }
     xf_set_viewport();
     {
         const VertexAttr *tc = texcoord_attr();
@@ -3597,8 +3998,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
 
-    if (s_pipe.head != s_pipe.drained && pipe_method_syncs(subch, method))
+    if (s_pipe.head != s_pipe.drained && pipe_method_syncs(subch, method)) {
+        s_pstat.drain_method++;
+        pipe_note_why(subch, method);
+        if (subch != 0)                       s_pstat.method_subch++;
+        else if (method < 0x0220)             s_pstat.method_low++;
+        else if (method <= 0x17D0)            s_pstat.method_report++;
+        else                                  s_pstat.method_semclear++;
         pipe_drain();
+    }
     /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
      * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
      * held 0xFF000000 at times, which put the write outside guest memory). */
@@ -4225,6 +4633,8 @@ static void peek_chain(void)
 
 void nv2a_pb_exec_report(void)
 {
+    if (s_pipe.head != s_pipe.drained)
+        s_pstat.drain_report++;
     pipe_drain();
     peek_addresses();
     peek_chain();
@@ -4249,6 +4659,57 @@ void nv2a_pb_exec_report(void)
             fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
                     (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
                     s_gpu.flips, 10);
+#if defined(_WIN32)
+        if (last_ms && now > last_ms) {
+            /* Since the last report: how often and how long the executor
+             * waited on the workers, and how idle the workers were. */
+            LARGE_INTEGER f;
+            double ms_per_tick, span = (double)(now - last_ms), idle = 0;
+            int w;
+            QueryPerformanceFrequency(&f);
+            ms_per_tick = 1000.0 / (double)f.QuadPart;
+            for (w = 0; w < s_pipe.n; w++) {
+                static uint64_t seen[NV_RASTER_MAX_THREADS];
+                uint64_t t = s_pipe.worker[w].idle_ticks;
+                idle += (double)(t - seen[w]) * ms_per_tick;
+                seen[w] = t;
+            }
+            fprintf(stderr, "[PIPE] %.0f ms: %u jobs (%.0f tris avg), ring %d:"
+                    " %u full waits %.0f ms; %u drains %.0f ms (scan %u,"
+                    " method %u [subch %u, <0x220 %u, report %u, sem/clear %u],"
+                    " exec-draw %u, report %u, hazard %u); worker idle %.0f%%\n",
+                    span, s_pstat.jobs,
+                    s_pstat.jobs ? (double)s_pstat.tris / s_pstat.jobs : 0.0,
+                    s_pipe_jobs, s_pstat.ring_waits,
+                    (double)s_pstat.ring_ticks * ms_per_tick, s_pstat.drains,
+                    (double)s_pstat.drain_ticks * ms_per_tick, s_pstat.drain_scan,
+                    s_pstat.drain_method, s_pstat.method_subch, s_pstat.method_low,
+                    s_pstat.method_report, s_pstat.method_semclear,
+                    s_pstat.drain_exec, s_pstat.drain_report, s_pstat.drain_hazard,
+                    s_pipe.n ? 100.0 * idle / (span * s_pipe.n) : 0.0);
+            fprintf(stderr, "[PIPE] vertices: %u transformed, %u from the"
+                    " batch cache\n", s_vcache_runs, s_vcache_hits);
+            s_vcache_runs = s_vcache_hits = 0;
+            {
+                int a, b;                 /* top drain methods, most first */
+                fprintf(stderr, "[PIPE] drains by method (subch:method x n):");
+                for (a = 0; a < 12; a++) {
+                    int best = -1;
+                    for (b = 0; b < 32; b++)
+                        if (s_pstat.why_n[b] && (best < 0
+                                || s_pstat.why_n[b] > s_pstat.why_n[best]))
+                            best = b;
+                    if (best < 0)
+                        break;
+                    fprintf(stderr, " %u:%04X x%u", s_pstat.why_key[best] >> 16,
+                            s_pstat.why_key[best] & 0xFFFF, s_pstat.why_n[best]);
+                    s_pstat.why_n[best] = 0;
+                }
+                fputc(10, stderr);
+            }
+        }
+        memset(&s_pstat, 0, sizeof s_pstat);
+#endif
         last_flips = s_gpu.flips;
         last_ms = now;
     }

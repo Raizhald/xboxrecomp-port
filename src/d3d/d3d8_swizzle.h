@@ -31,6 +31,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 /**
  * Spread bits of v into even bit positions.
@@ -125,6 +128,35 @@ static inline uint32_t swizzle_offset(uint32_t x, uint32_t y,
                                        uint32_t width, uint32_t height)
 {
     uint32_t mask_x, mask_y;
+
+    /* Power-of-two textures interleave only the low min(log2(w),log2(h))
+     * bits. The remaining bits of the longer axis follow contiguously.
+     * Compute that directly instead of rebuilding masks and depositing one
+     * bit at a time for every sampled texel. Keep the general mask path for
+     * other dimensions, including values beyond the 16-bit spread helper. */
+    if (width && height && width <= 0x10000u && height <= 0x10000u
+            && !(width & (width - 1u)) && !(height & (height - 1u))) {
+        uint32_t minor_dim = width < height ? width : height;
+        uint32_t low_mask = minor_dim - 1u, shift;
+        uint32_t low, high;
+#if defined(_MSC_VER)
+        unsigned long bit;
+        _BitScanForward(&bit, minor_dim);
+        shift = (uint32_t)bit;
+#elif defined(__GNUC__) || defined(__clang__)
+        shift = (uint32_t)__builtin_ctz(minor_dim);
+#else
+        shift = 0;
+        while ((minor_dim >> shift) > 1u)
+            shift++;
+#endif
+        x &= width - 1u;
+        y &= height - 1u;
+        low = swizzle_spread(x & low_mask)
+            | (swizzle_spread(y & low_mask) << 1);
+        high = (width > height ? x : y) & ~low_mask;
+        return low | (high << shift);
+    }
 
     xbox_swizzle_masks(width, height, &mask_x, &mask_y);
     return swizzle_deposit(x, mask_x) | swizzle_deposit(y, mask_y);

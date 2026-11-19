@@ -43,6 +43,9 @@ void nv2a_vsh_set_start_slot(uint32_t slot);          /* _PROGRAM_START     */
 void nv2a_vsh_set_constant_load(uint32_t index);      /* _CONSTANT_LOAD     */
 void nv2a_vsh_constant_word(uint32_t word);           /* _CONSTANT(i)       */
 void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
+/* Whether a program may write c[] (CXT_WRITE_EN): then a vertex's result can
+ * depend on the vertices run before it. */
+int nv2a_vsh_cxt_write_enabled(void);
 
 /* Run the program from the start slot on one vertex. Inputs are the ten
  * attribute values as floats. Returns 0 if there is no program to run (no

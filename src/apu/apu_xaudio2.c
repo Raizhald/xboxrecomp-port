@@ -25,11 +25,15 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-/* Device buffer size and count. Defaults 512 x 4 (10.7 ms each, 43 ms
+/* Device buffer size and count. Defaults 512 x 8 (10.7 ms each, 85 ms
  * worst case queued); RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT
- * override them at xa2_init, clamped to the static storage below. */
+ * override them at xa2_init, clamped to the static storage below.
+ * Four buffers (43 ms) were too few on Windows: the APU thread's waits
+ * round up to the ~15.6 ms system timer, so submits come up to ~21 ms
+ * apart, and Fallout: BoS starved ~600 times per 160 s run (7.6 s of audio
+ * lost); with eight, none, at the same FPS. */
 #define XA2_BUF_SAMPLES_DEFAULT 512
-#define XA2_NUM_BUFS_DEFAULT    4
+#define XA2_NUM_BUFS_DEFAULT    8
 #define XA2_BUF_SAMPLES_MIN     128
 #define XA2_BUF_SAMPLES_MAX     4096
 #define XA2_NUM_BUFS_MIN        2
@@ -100,6 +104,15 @@ int xa2_init(void)
     if (FAILED(hr)) {
         fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
         goto fail;
+    }
+    /* Keep the APU and its completion timing running during silent tests. */
+    {
+        const char *mute = getenv("RECOMP_AUDIO_MUTE");
+        if (mute && atoi(mute) != 0) {
+            hr = IXAudio2MasteringVoice_SetVolume(g_xa2_master, 0.0f, XAUDIO2_COMMIT_NOW);
+            if (FAILED(hr)) goto fail;
+            fprintf(stderr, "[XA2] host playback muted\n");
+        }
     }
 
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
