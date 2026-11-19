@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(swizzle_offset_regression C)
+set(CMAKE_C_STANDARD 11)
+enable_testing()
+add_executable(swizzle-offset-test test_main.c)
+target_include_directories(swizzle-offset-test PRIVATE ../../src/d3d)
+add_test(NAME swizzle-offset-equivalence COMMAND swizzle-offset-test)
+add_test(NAME swizzle-rect-roundtrip COMMAND swizzle-offset-test roundtrip)

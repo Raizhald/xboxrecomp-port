@@ -94,16 +94,19 @@ static void put_vertex(uint32_t n, float x, float y, uint32_t c)
     memcpy(s_mem + DIFF_AT + 4u * n, &c, 4);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     static const float I[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
     uint32_t n = 0, start;
     int i, x, y, bad = 0, drawn = 0;
+    const char *threads = argc > 1 ? argv[1] : "4";
+    if (atoi(threads) < 1 || atoi(threads) > 16)
+        return 2;
 
 #ifdef _WIN32
-    _putenv("RECOMP_RASTER_THREADS=4");
+    _putenv_s("RECOMP_RASTER_THREADS", threads);
 #else
-    setenv("RECOMP_RASTER_THREADS", "4", 1);
+    setenv("RECOMP_RASTER_THREADS", threads, 1);
 #endif
 
     m(0x0208, 0x0008);                       /* SET_SURFACE_FORMAT: A8R8G8B8, no AA */
