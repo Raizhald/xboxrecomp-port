@@ -2163,10 +2163,19 @@ class Lifter:
         return [f"/* {m}: unhandled */"]
 
     def _lift_shift(self, insn, ops, c_op):
+        """shl/sal/shr. The count is masked to 5 bits, as x86 does for 8-, 16-
+        and 32-bit operands (see _lift_sar). Unmasked, "shr esi, cl" with
+        cl = 32 became "esi >> 32" in C -- undefined, where the processor
+        shifts by 0 and leaves esi alone. Bink's bit reader shifts by cl;
+        its menu and intro videos showed scattered garbage 8x8 blocks."""
         if len(ops) < 2:
             return [f"/* shift: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
+        if ops[1].type == "imm":
+            cnt = hex(ops[1].imm & 31)
+        else:
+            cnt = f"(({cnt}) & 31u)"
         out = []
         if self.needs_cf:
             w = (_operand_width(ops[0]) or 4) * 8
