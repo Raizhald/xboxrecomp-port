@@ -3310,6 +3310,8 @@ class BatchTranslator:
             "total_lines": 0,
         }
 
+        from .lifter import CALLRET_CONSUMED
+        CALLRET_CONSUMED.clear()
         for i, (addr, func_info) in enumerate(func_list):
             name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             if verbose and (i % 500 == 0 or i == len(func_list) - 1):
@@ -3332,6 +3334,25 @@ class BatchTranslator:
                 stub += f"void {name}(void) {{ /* translation failed */ }}\n"
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
+
+        # Functions whose callers branch on the flags they return: lift them
+        # again, publishing EFLAGS at every ret (lifter.CALLRET_CONSUMED).
+        if CALLRET_CONSUMED:
+            info = dict(func_list)
+            lifter = self.translator.lifter
+            lifter.publish_rflags = True
+            try:
+                for k, (addr, name, code) in enumerate(translations):
+                    if addr in CALLRET_CONSUMED and addr in info:
+                        again = self.translator.translate_function(addr, info[addr])
+                        if again:
+                            stats["total_lines"] += again.count("\n") - code.count("\n")
+                            translations[k] = (addr, name, again)
+            finally:
+                lifter.publish_rflags = False
+            if verbose:
+                print(f"  {len(CALLRET_CONSUMED)} functions return flags their callers"
+                      " branch on (g_rflags)", file=sys.stderr)
 
         # A wrapped function's body is sub_X_gen; the hand-written sub_X is
         # what callers and indirect dispatch must reach, so declare it like

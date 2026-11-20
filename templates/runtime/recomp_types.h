@@ -194,6 +194,11 @@ extern RECOMP_TLS uint32_t g_fs_base;
 
 extern RECOMP_TLS uint32_t g_seh_ebp;
 
+/* EFLAGS a function returns, for the few callers that branch on them right
+ * after the call (ZF 1, CF 2, SF 4, OF 8). Written at ret only by functions
+ * the lifter saw used that way. */
+extern RECOMP_TLS uint32_t g_rflags;
+
 /* ---- non-local jumps (setjmp / longjmp) --------------------------------
  *
  * A recompiled function is a real C function, so restoring the guest esp is

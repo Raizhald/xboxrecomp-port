@@ -506,6 +506,49 @@ def _has_xmm_operand(ops):
                for op in (ops or ()))
 
 
+# Flags returned by a call. Hand-written library code (the XDK's x87 math
+# helpers: "is this double a NaN/inf?" as ZF) returns results in EFLAGS and
+# the caller branches on them right after the call. "call" used to count as
+# flag-preserving, so that branch read the caller's own compare from before
+# the call. Now a call leaves the setter "callret"; a branch on it reads
+# g_rflags (ZF 1, CF 2, SF 4, OF 8), which the callee publishes at its ret.
+# Only callees somebody branches on publish (CALLRET_CONSUMED, filled while
+# lifting, then those functions are lifted again with publish_rflags).
+CALLRET_CONSUMED = set()
+_CALLRET_COND = {
+    "je": "(g_rflags & 1u)", "jz": "(g_rflags & 1u)",
+    "jne": "!(g_rflags & 1u)", "jnz": "!(g_rflags & 1u)",
+    "jb": "(g_rflags & 2u)", "jc": "(g_rflags & 2u)", "jnae": "(g_rflags & 2u)",
+    "jae": "!(g_rflags & 2u)", "jnc": "!(g_rflags & 2u)", "jnb": "!(g_rflags & 2u)",
+    "jbe": "(g_rflags & 3u)", "jna": "(g_rflags & 3u)",
+    "ja": "!(g_rflags & 3u)", "jnbe": "!(g_rflags & 3u)",
+    "js": "(g_rflags & 4u)", "jns": "!(g_rflags & 4u)",
+    "jo": "(g_rflags & 8u)", "jno": "!(g_rflags & 8u)",
+    "jl": "(((g_rflags >> 2) ^ (g_rflags >> 3)) & 1u)",
+    "jnge": "(((g_rflags >> 2) ^ (g_rflags >> 3)) & 1u)",
+    "jge": "!(((g_rflags >> 2) ^ (g_rflags >> 3)) & 1u)",
+    "jnl": "!(((g_rflags >> 2) ^ (g_rflags >> 3)) & 1u)",
+    "jle": "((g_rflags & 1u) | (((g_rflags >> 2) ^ (g_rflags >> 3)) & 1u))",
+    "jng": "((g_rflags & 1u) | (((g_rflags >> 2) ^ (g_rflags >> 3)) & 1u))",
+    "jg": "!((g_rflags & 1u) | (((g_rflags >> 2) ^ (g_rflags >> 3)) & 1u))",
+    "jnle": "!((g_rflags & 1u) | (((g_rflags >> 2) ^ (g_rflags >> 3)) & 1u))",
+}
+
+
+def _rflags_publish(flag_setter, flag_ops):
+    """The statement a publishing function runs at ret, or None."""
+    if not flag_setter or flag_setter == "callret":
+        return None
+    parts = []
+    for jcc, bit in (("je", 1), ("jb", 2), ("js", 4), ("jo", 8)):
+        c = _make_condition(jcc, flag_setter, flag_ops)
+        if c:
+            parts.append(f"(({c[0]}) ? {bit}u : 0u)")
+    if not parts:
+        return None
+    return f"g_rflags = {' | '.join(parts)}; /* flags out ({flag_setter}) */"
+
+
 def _make_condition(jcc, flag_setter, flag_ops):
     """
     Generate a C condition expression for a jcc based on what set the flags.
@@ -516,6 +559,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if not cond_info:
         return None
     cmp_macro, test_macro, desc = cond_info
+
+    if flag_setter == "callret":
+        expr = _CALLRET_COND.get(jcc)
+        if not expr:
+            return None
+        if flag_ops and flag_ops[0]:
+            CALLRET_CONSUMED.add(flag_ops[0])
+        return expr, desc + " (flags from the call)"
 
     # A join whose predecessors disagree on which instruction set the flags,
     # but agree that the zero flag came from the same destination register.
@@ -4150,10 +4201,19 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 if zf:
                     stmts.append(f"_flags = ({zf[0]}) ? 1 : 0;"
                                  " /* ZF in: a zero count keeps it */")
+        if curr.is_ret and getattr(lifter, "publish_rflags", False):
+            pub = _rflags_publish(last_flag_setter, last_flag_ops)
+            if pub:
+                stmts.append(pub)
         stmts.extend(results)
 
         # Track flag-setting instructions
-        if (curr.mnemonic in _BARE_STRING_COMPARES
+        if curr.mnemonic == "call":
+            # The callee decides the flags (see CALLRET_CONSUMED).
+            last_flag_setter = "callret"
+            last_flag_ops = [getattr(curr, "call_target", None)
+                             or getattr(curr, "jump_target", None) or 0]
+        elif (curr.mnemonic in _BARE_STRING_COMPARES
                 and not _has_xmm_operand(curr.operands)):
             # A single cmps/scas sets the flags like cmp. "cmpsd" is also
             # the SSE2 scalar compare, which is why it sits in
