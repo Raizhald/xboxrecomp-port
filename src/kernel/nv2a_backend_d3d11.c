@@ -250,6 +250,7 @@ static const char k_hlsl[] =
 "  return true;\n"
 "}\n"
 "float4 PSMain(PSIn i) : SV_Target {\n"
+"  if (g_misc.z != 0) return g_fc0;\n"   /* RECOMP_SILHOUETTE pass: flat colour */
 "  float4 o;\n"
 "  float2 u0 = suv(i.t0, 0), u1 = suv(i.t1, 1), u2 = suv(i.t2, 2), u3 = suv(i.t3, 3);\n"
 "  float2 un = i.t0.xy * g_tscale[0].xy + g_tscale[0].zw;\n"
@@ -363,6 +364,18 @@ static struct {
      * plus bicubic (B-spline) magnification. Textures the title samples
      * nearest -- HUD strips, lookup tables -- stay nearest in every mode. */
     uint32_t texfilter;
+    /* RECOMP_SILHOUETTE: the player's batches of this frame, drawn again
+     * where something hides them (depth GREATER, stencil != 1). */
+    int sil;
+    float sil_color[4];
+    GVert *sil_v;
+    uint32_t sil_nv, sil_n, sil_frame;
+    struct { uint32_t first, count; float vp[4], wsx[4]; } sil_b[64];
+    Nv2aSurface sil_s;
+    uint32_t sil_zeta;
+    void *sil_rt;
+    ID3D11Buffer *sil_vb;
+    ID3D11BlendState *sil_bs;
     /* RECOMP_WIDESCREEN: full-screen targets (480 lines, 4:3 or wider) are
      * this much wider than the guest asks; 1.0 off. 16:9 is 4/3. */
     float ws;
@@ -568,6 +581,21 @@ static int g_init(void)
                 G.texfilter == 2 ? "mipmaps, trilinear, bicubic magnification"
                                  : "mipmaps, trilinear");
         fflush(stderr);
+    }
+    e = getenv("RECOMP_SILHOUETTE");
+    if (e && *e && *e != '0') {
+        uint32_t argb = 0x9050B0FFu;    /* light blue, about half see-through */
+        const char *c = getenv("RECOMP_SILHOUETTE_COLOR");
+        if (c && *c)
+            argb = (uint32_t)strtoul(c, NULL, 16);
+        /* 2: debugging -- the whole player in the colour, hidden or not,
+         * to see which batches count as the player. */
+        G.sil = atoi(e) == 2 ? 2 : 1;
+        G.sil_color[0] = (float)((argb >> 16) & 0xFF) / 255.0f;
+        G.sil_color[1] = (float)((argb >> 8) & 0xFF) / 255.0f;
+        G.sil_color[2] = (float)(argb & 0xFF) / 255.0f;
+        G.sil_color[3] = (float)(argb >> 24) / 255.0f;
+        fprintf(stderr, "[GPUB] player silhouette behind walls (colour %08X)\n", argb);
     }
     G.ws = 1.0f;
     e = getenv("RECOMP_WIDESCREEN");
@@ -808,7 +836,8 @@ static GDepth *g_depth_get(uint32_t va, uint32_t w, uint32_t h, int *fresh)
     td.Width = w * G.scale;
     td.Height = h * G.scale;
     td.MipLevels = td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_D32_FLOAT;
+    /* A stencil too for RECOMP_SILHOUETTE (which pixels show the player). */
+    td.Format = G.sil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
@@ -823,7 +852,7 @@ static GDepth *g_depth_get(uint32_t va, uint32_t w, uint32_t h, int *fresh)
     G.depth[i].last_frame = G.frame;
     /* The software path starts a new depth buffer at "infinitely far". */
     ID3D11DeviceContext_ClearDepthStencilView(G.ctx, G.depth[i].dsv,
-                                              D3D11_CLEAR_DEPTH, 1.0f, 0);
+                                              D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
     *fresh = 1;
     return &G.depth[i];
 }
@@ -1128,15 +1157,31 @@ static ID3D11BlendState *g_blend(const Nv2aRenderState *rs)
     return G.blend[i].s;
 }
 
+/* smode (RECOMP_SILHOUETTE): 0 stencil untouched; 1 the stencil takes the
+ * reference (1 player, 0 anything else) where the batch passes the depth
+ * test; 2 the silhouette pass -- depth GREATER, no writes, stencil != 1. */
+static ID3D11DepthStencilState *g_dss_s(const Nv2aRenderState *rs, int has_depth, int smode);
 static ID3D11DepthStencilState *g_dss(const Nv2aRenderState *rs, int has_depth)
+{
+    return g_dss_s(rs, has_depth, 0);
+}
+
+static ID3D11DepthStencilState *g_dss_s(const Nv2aRenderState *rs, int has_depth, int smode)
 {
     /* The software path writes depth whenever DEPTH_MASK is set, tested or
      * not; D3D writes only with the test on, so "not tested" is ALWAYS. */
-    uint32_t test = has_depth && rs->depth_test_enable;
-    uint32_t write = has_depth && rs->depth_write;
+    uint32_t test = has_depth && rs && rs->depth_test_enable;
+    uint32_t write = has_depth && rs && rs->depth_write;
     uint32_t func = test ? rs->depth_func : 0x207;
-    uint32_t key = (test || write) << 16 | write << 12 | (func & 0xFFF), i;
+    uint32_t key, i;
     D3D11_DEPTH_STENCIL_DESC dd;
+
+    if (smode == 2) {
+        test = 1;
+        write = 0;
+        func = G.sil == 2 ? 0x207 : 0x204;  /* GREATER (2: ALWAYS) */
+    }
+    key = (uint32_t)smode << 20 | (test || write) << 16 | write << 12 | (func & 0xFFF);
 
     for (i = 0; i < 32 && G.dss[i].s; i++)
         if (G.dss[i].key == key)
@@ -1151,6 +1196,15 @@ static ID3D11DepthStencilState *g_dss(const Nv2aRenderState *rs, int has_depth)
     dd.DepthFunc = (func >= 0x200 && func <= 0x207)
                  ? (D3D11_COMPARISON_FUNC)(func - 0x200 + 1) : D3D11_COMPARISON_ALWAYS;
     dd.StencilEnable = FALSE;
+    if (smode) {
+        dd.StencilEnable = TRUE;
+        dd.StencilReadMask = dd.StencilWriteMask = 0xFF;
+        dd.FrontFace.StencilFailOp = dd.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+        dd.FrontFace.StencilPassOp = smode == 1 ? D3D11_STENCIL_OP_REPLACE : D3D11_STENCIL_OP_KEEP;
+        dd.FrontFace.StencilFunc = smode == 1 || G.sil == 2 ? D3D11_COMPARISON_ALWAYS
+                                                             : D3D11_COMPARISON_NOT_EQUAL;
+        dd.BackFace = dd.FrontFace;
+    }
     if (FAILED(ID3D11Device_CreateDepthStencilState(G.dev, &dd, &G.dss[i].s)))
         return NULL;
     G.dss[i].key = key;
@@ -1174,6 +1228,51 @@ static void g_time_end(const LARGE_INTEGER *t0)
 }
 
 /* ---- Back end ---------------------------------------------------------- */
+
+static nv2a_focus_fn s_focus_hook;
+void nv2a_backend_set_focus_hook(nv2a_focus_fn fn) { s_focus_hook = fn; }
+static struct { uint32_t frame; int ok; float v[4]; } s_focus = { 0xFFFFFFFFu, 0, { 0 } };
+
+static int g_focus(void)
+{
+    if (s_focus.frame != G.frame) {
+        s_focus.frame = G.frame;
+        s_focus.ok = s_focus_hook ? s_focus_hook(s_focus.v) : 0;
+    }
+    return s_focus.ok;
+}
+
+/* RECOMP_FOCUS_DEBUG: every 300th frame, each batch drawn into the frame near
+ * the player -- for tuning which batches are the player. */
+static void g_focus_debug(const GRt *rt, const Nv2aBatch *b)
+{
+    static int on = -1;
+    float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, w0 = 1e30f, w1 = -1e30f;
+    float fx, fy;
+    uint32_t i;
+    if (on < 0) on = getenv("RECOMP_FOCUS_DEBUG") != NULL;
+    if (!on || G.frame % 300 || rt->h < 448 || !g_focus())
+        return;
+    for (i = 0; i < b->count; i++) {
+        const Nv2aVertex *v = &b->vertices[i];
+        float w = v->rhw > 0.0f ? 1.0f / v->rhw : 0.0f;
+        if (v->x < x0) x0 = v->x;
+        if (v->x > x1) x1 = v->x;
+        if (v->y < y0) y0 = v->y;
+        if (v->y > y1) y1 = v->y;
+        if (w < w0) w0 = w;
+        if (w > w1) w1 = w;
+    }
+    fx = s_focus.v[0] * (float)rt->w;
+    fy = s_focus.v[1] * (float)rt->h;
+    if (fx < x0 - 40 || fx > x1 + 40 || fy < y0 - 40 || fy > y1 + 40)
+        return;
+    fprintf(stderr, "[FOCUS] f%u rt %ux%u focus %.0f,%.0f w %.1f h %.3f | n %u x %.0f..%.0f"
+                    " y %.0f..%.0f w %.1f..%.1f dw %u dt %u ext %d tex %08X\n",
+            G.frame, rt->w, rt->h, fx, fy, s_focus.v[2], s_focus.v[3], b->count,
+            x0, x1, y0, y1, w0, w1, b->state->depth_write, b->state->depth_test_enable,
+            b->ext != NULL, b->stage[0] ? b->stage[0]->offset : (b->texture ? b->texture->offset : 0));
+}
 
 /* The surface's clip rectangle in target pixels. In a widened target a
  * clip covering the guest's whole width covers the whole target; a smaller
@@ -1259,7 +1358,7 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
                                            : (float)(zstencil >> 8);
             z /= rs->zmax > 0.0f ? rs->zmax : 16777215.0f;
             ID3D11DeviceContext_ClearDepthStencilView(G.ctx, d->dsv,
-                                                      D3D11_CLEAR_DEPTH, z, 0);
+                                                      D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, z, 0);
         }
     }
     g_time_end(&t0);
@@ -1293,6 +1392,165 @@ static ID3D11ShaderResourceView *g_self_copy(GRt *rt)
                                      (ID3D11Resource *)rt->tex);
     G.n_selfcopy++;
     return G.copy_srv;
+}
+
+static void g_vert(const Nv2aBatch *b, uint32_t k, GVert *o)
+{
+    const Nv2aVertex *v = &b->vertices[k];
+    o->pos[0] = v->x; o->pos[1] = v->y; o->pos[2] = v->z; o->pos[3] = v->rhw;
+    if (b->ext) {
+        const Nv2aVertexEx *e = &b->ext[k];
+        memcpy(o->d0, e->d0, 16);
+        memcpy(o->d1, e->d1, 16);
+        o->fog[0] = e->fog; o->fog[1] = o->fog[2] = o->fog[3] = 0.0f;
+        memcpy(o->t, e->tex, 64);
+    } else {
+        g_unpack(v->diffuse, o->d0);
+        memset(o->d1, 0, 16);
+        o->fog[0] = 1.0f; o->fog[1] = o->fog[2] = o->fog[3] = 0.0f;
+        memset(o->t, 0, 64);
+        o->t[0][0] = v->u; o->t[0][1] = v->v; o->t[0][3] = 1.0f;
+    }
+}
+
+/* RECOMP_SILHOUETTE: is this batch (part of) the player? Opaque, depth-
+ * tested, drawn into the frame, small, around the player's point on screen
+ * (nv2a_backend_set_focus_hook) and at the player's distance. Tuned on
+ * Carbon (RECOMP_FOCUS_DEBUG): the body's pieces span ~70x50 of 1280x480
+ * and sit 0..35 units nearer than the middle of the body; the ground, the
+ * shadow and walls fail one test or another. Someone standing right next
+ * to the player may pass too, which only outlines them as well. */
+static int g_is_player(const GRt *rt, const Nv2aBatch *b)
+{
+    const Nv2aRenderState *rs = b->state;
+    float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, w0 = 1e30f, w1 = -1e30f;
+    float fx, fy, fw, mx, my, sx;
+    uint32_t i;
+    if (!G.sil || !b->ext || !rs->depth_write || !rs->depth_test_enable
+        || rt->h < 448 || b->count < 30 || !g_focus())
+        return 0;
+    sx = (float)rt->w / ((float)rt->h * 4.0f / 3.0f);   /* 2 on the 2x-wide frame */
+    fx = s_focus.v[0] * (float)rt->w;
+    fy = s_focus.v[1] * (float)rt->h;
+    fw = s_focus.v[2];
+    my = 0.08f * (float)rt->h;
+    mx = my * sx;
+    for (i = 0; i < b->count; i++) {
+        const Nv2aVertex *v = &b->vertices[i];
+        float w;
+        if (!(v->rhw > 0.0f))
+            return 0;
+        w = 1.0f / v->rhw;
+        if (v->x < x0) x0 = v->x;
+        if (v->x > x1) x1 = v->x;
+        if (v->y < y0) y0 = v->y;
+        if (v->y > y1) y1 = v->y;
+        if (w < w0) w0 = w;
+        if (w > w1) w1 = w;
+    }
+    if (fx < x0 - mx || fx > x1 + mx || fy < y0 - my || fy > y1 + my)
+        return 0;
+    if (y1 - y0 > 0.25f * (float)rt->h || x1 - x0 > 0.25f * (float)rt->h * sx)
+        return 0;
+    return w1 > fw - 60.0f && w0 < fw + 5.0f;
+}
+
+static void g_sil_record(const GRt *rt, const Nv2aSurface *s, const Nv2aBatch *b,
+                         const float vp[4], const float wsx[4])
+{
+    uint32_t k;
+    if (G.sil_frame != G.frame || G.sil_rt != (void *)rt) {
+        G.sil_n = G.sil_nv = 0;
+        G.sil_frame = G.frame;
+        G.sil_rt = (void *)rt;
+    }
+    if (!G.sil_v && !(G.sil_v = (GVert *)malloc(65536 * sizeof(GVert))))
+        return;
+    if (G.sil_n >= 64 || G.sil_nv + b->count > 65536)
+        return;
+    for (k = 0; k < b->count; k++)
+        g_vert(b, k, &G.sil_v[G.sil_nv + k]);
+    G.sil_b[G.sil_n].first = G.sil_nv;
+    G.sil_b[G.sil_n].count = b->count;
+    memcpy(G.sil_b[G.sil_n].vp, vp, sizeof G.sil_b[0].vp);
+    memcpy(G.sil_b[G.sil_n].wsx, wsx, sizeof G.sil_b[0].wsx);
+    G.sil_n++;
+    G.sil_nv += b->count;
+    G.sil_s = *s;
+    G.sil_zeta = b->state->zeta_va;
+}
+
+/* Draw the recorded player batches flat where they are hidden. */
+static void g_sil_flush(GRt *rt)
+{
+    static ID3D11ShaderResourceView *const none[4] = { NULL, NULL, NULL, NULL };
+    GDepth *depth;
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t i, stride = sizeof(GVert), off = 0;
+    int fresh;
+    if (!G.sil_n || G.sil_frame != G.frame || G.sil_rt != (void *)rt)
+        return;
+    G.sil_n = 0;
+    depth = g_depth_get(G.sil_zeta, rt->ew, rt->h, &fresh);
+    if (!depth || fresh)
+        return;
+    if (!G.sil_vb) {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = 65536 * sizeof(GVert);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateBuffer(G.dev, &bd, NULL, &G.sil_vb)))
+            return;
+    }
+    if (!G.sil_bs) {
+        D3D11_BLEND_DESC bd;
+        memset(&bd, 0, sizeof bd);
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+        bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(ID3D11Device_CreateBlendState(G.dev, &bd, &G.sil_bs)))
+            return;
+    }
+    if (FAILED(ID3D11DeviceContext_Map(G.ctx, (ID3D11Resource *)G.sil_vb, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return;
+    memcpy(m.pData, G.sil_v, (size_t)G.sil_nv * sizeof(GVert));
+    ID3D11DeviceContext_Unmap(G.ctx, (ID3D11Resource *)G.sil_vb, 0);
+    g_bind_target(rt, depth->dsv, &G.sil_s);
+    ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 4, none);
+    ID3D11DeviceContext_IASetInputLayout(G.ctx, G.layout);
+    ID3D11DeviceContext_IASetPrimitiveTopology(G.ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_IASetVertexBuffers(G.ctx, 0, 1, &G.sil_vb, &stride, &off);
+    ID3D11DeviceContext_VSSetShader(G.ctx, G.vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(G.ctx, 0, 1, &G.cb);
+    ID3D11DeviceContext_PSSetShader(G.ctx, G.ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(G.ctx, 0, 1, &G.cb);
+    ID3D11DeviceContext_RSSetState(G.ctx, G.raster);
+    ID3D11DeviceContext_OMSetBlendState(G.ctx, G.sil_bs, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(G.ctx, g_dss_s(NULL, 1, 2), 1);
+    for (i = 0; i < 64 && G.sil_b[i].count; i++) {
+        GCB *cb;
+        if (FAILED(ID3D11DeviceContext_Map(G.ctx, (ID3D11Resource *)G.cb, 0,
+                                           D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            break;
+        cb = (GCB *)m.pData;
+        memset(cb, 0, sizeof *cb);
+        memcpy(cb->vp, G.sil_b[i].vp, sizeof cb->vp);
+        memcpy(cb->wsx, G.sil_b[i].wsx, sizeof cb->wsx);
+        cb->misc[2] = 1;
+        memcpy(cb->fc0, G.sil_color, sizeof cb->fc0);
+        ID3D11DeviceContext_Unmap(G.ctx, (ID3D11Resource *)G.cb, 0);
+        ID3D11DeviceContext_Draw(G.ctx, G.sil_b[i].count, G.sil_b[i].first);
+    }
+    memset(G.sil_b, 0, sizeof G.sil_b);
+    G.sil_nv = 0;
 }
 
 /* Does the batch cover exactly the guest's whole frame (one quad, corners
@@ -1340,7 +1598,8 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     GCB *cb;
     float bf[4];
     uint32_t i, st, done;
-    int use_rc = b->rc != NULL && b->ext != NULL, fresh, stretch;
+    int use_rc = b->rc != NULL && b->ext != NULL, fresh, stretch, is_player = 0, smode = 0;
+    float sil_vp[4], sil_wsx[4];
 
     if (!b->count)
         return;
@@ -1350,9 +1609,14 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         g_time_end(&t0);
         return;
     }
+    /* The first undepth-tested draw after the player (the HUD, usually)
+     * is where the 3D scene is complete: the silhouette goes in first. */
+    if (G.sil && !rs->depth_test_enable && G.sil_n)
+        g_sil_flush(rt);
     if (rs->depth_test_enable || rs->depth_write)
         depth = g_depth_get(rs->zeta_va, rt->ew, rt->h, &fresh);
     g_bind_target(rt, depth ? depth->dsv : NULL, s);
+    is_player = g_is_player(rt, b);
 
     if (FAILED(ID3D11DeviceContext_Map(G.ctx, (ID3D11Resource *)G.cb, 0,
                                        D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -1362,6 +1626,7 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     cb = (GCB *)m.pData;
     memset(cb, 0, sizeof *cb);
     stretch = rt->ew != rt->w && g_ws_fullscreen(b, rt, use_rc);
+    g_focus_debug(rt, b);
 
     if (rt->ew == rt->w) {
         cb->vp[0] = 2.0f / (float)rt->w;
@@ -1453,6 +1718,8 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         g_unpack(b->fog_color, cb->fogc);
         { float r = cb->fogc[2]; cb->fogc[2] = cb->fogc[0]; cb->fogc[0] = r; }
     }
+    memcpy(sil_vp, cb->vp, sizeof sil_vp);
+    memcpy(sil_wsx, cb->wsx, sizeof sil_wsx);
     ID3D11DeviceContext_Unmap(G.ctx, (ID3D11Resource *)G.cb, 0);
 
     ID3D11DeviceContext_IASetInputLayout(G.ctx, G.layout);
@@ -1471,7 +1738,15 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         g_unpack(rs->blend_color, bf);
     }
     ID3D11DeviceContext_OMSetBlendState(G.ctx, g_blend(rs), bf, 0xFFFFFFFFu);
-    ID3D11DeviceContext_OMSetDepthStencilState(G.ctx, g_dss(rs, depth != NULL), 0);
+    /* RECOMP_SILHOUETTE: every depth-writing draw into the frame marks its
+     * visible pixels 1 if it is the player and 0 if not, so the stencil ends
+     * up 1 exactly where the player is seen. */
+    if (G.sil && depth && rs->depth_write && rs->depth_test_enable && rt->h >= 448)
+        smode = 1;
+    ID3D11DeviceContext_OMSetDepthStencilState(G.ctx, g_dss_s(rs, depth != NULL, smode),
+                                               (UINT)is_player);
+    if (is_player)
+        g_sil_record(rt, s, b, sil_vp, sil_wsx);
 
     /* Vertices, through a ring: appended while they fit, discarded and
      * restarted when not; a batch bigger than the ring goes in pieces. */
@@ -1948,6 +2223,8 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
     if (!rt || !pitch || (bpp != 2 && bpp != 4))
         return;
     g_time_begin(&t0);
+    if (G.sil)
+        g_sil_flush(rt);
     g_rt_dump(rt);
     g_present(rt);
     if (P.sc && !P.readback) {

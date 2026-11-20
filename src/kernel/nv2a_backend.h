@@ -137,6 +137,15 @@ typedef struct {
     void (*resolve)(uint32_t color_va, uint32_t pitch, uint32_t bytes_per_pixel);
 } Nv2aBackend;
 
+/* Where the title's player is on screen, for back-end effects that single
+ * the player out (RECOMP_SILHOUETTE). The hook fills out[0..3]: x and y as
+ * fractions of the 4:3 frame (0..1, y down), the player's distance along
+ * the view (what 1/rhw of its vertices comes to), and its height as a
+ * fraction of the frame's height; it returns 0 when there is no player.
+ * Asked once per frame, at the frame's first draw into the frame. */
+typedef int (*nv2a_focus_fn)(float out[4]);
+void nv2a_backend_set_focus_hook(nv2a_focus_fn fn);
+
 /* Register (or, with NULL, remove) the back end. Call before the title starts
  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */
 void nv2a_backend_register(const Nv2aBackend *backend);
