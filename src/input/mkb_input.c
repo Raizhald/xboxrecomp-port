@@ -51,11 +51,13 @@ typedef struct {
     int    drag_btn;    /* mouse button mask that drags (mouse=drag) */
     int    drag_y;      /* drag moves the stick vertically too       */
     double walk;        /* left stick length while "walk" is held    */
+    int    crosshair;   /* mouse = cursor: draw the pointer as a sight */
+    unsigned crosshair_color; /* 0xRRGGBB                             */
 } MkbConfig;
 
 enum { MKB_MOUSE_AIM, MKB_MOUSE_DRAG, MKB_MOUSE_OFF, MKB_MOUSE_CURSOR };
 
-static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 8, 0, 0, MKB_MOUSE_AIM, 4, 0, 0.5 };
+static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 8, 0, 0, MKB_MOUSE_AIM, 4, 0, 0.5, 1, 0xFFFFFF };
 
 /* ---- bindings ----------------------------------------------------------
  *
@@ -205,6 +207,10 @@ static int mkb_apply_kv(const char *key, const char *val)
         if (l >= 0 && l < 5) s_cfg.drag_btn = 1 << l;
     } else if (!strcmp(key, "drag_y")) {
         s_cfg.drag_y = atoi(val) != 0;
+    } else if (!strcmp(key, "crosshair")) {
+        s_cfg.crosshair = atoi(val) != 0;
+    } else if (!strcmp(key, "crosshair_color")) {
+        s_cfg.crosshair_color = (unsigned)strtoul(val, NULL, 16) & 0xFFFFFFu;
     } else if (!strcmp(key, "walk")) {
         d = strtod(val, NULL); if (d > 0.0 && d <= 1.0) s_cfg.walk = d;
     } else {
@@ -467,6 +473,8 @@ static int game_is_foreground(void)
  * does not move the pointer by itself, but Windows still moves it from
  * the same physical movement, so it would wander across the screen and
  * end up clicking other apps' title bars. */
+static void mkb_set_sight(HWND hwnd, int on);
+
 static void mkb_manage_cursor(int capture)
 {
     static int hidden;          /* how many ShowCursor(FALSE) we owe  */
@@ -480,6 +488,8 @@ static void mkb_manage_cursor(int capture)
     if (capture) {
         RECT r;
         HWND fg = GetForegroundWindow();
+        if (fg)
+            mkb_set_sight(fg, 1);
         if (fg && GetClientRect(fg, &r)) {
             /* Client area in screen coordinates: the pointer cannot leave
              * the picture for the title bar or another app. */
@@ -493,8 +503,113 @@ static void mkb_manage_cursor(int capture)
         if (s_cfg.mouse != MKB_MOUSE_CURSOR && hidden < 5) { ShowCursor(FALSE); hidden++; }
         if (s_cfg.mouse == MKB_MOUSE_CURSOR && hidden > 0) { ShowCursor(TRUE); hidden--; }
     } else {
+        mkb_set_sight(NULL, 0);
         if (hidden > 0) { ShowCursor(TRUE); hidden--; }
         ClipCursor(NULL);
+    }
+}
+
+/* The pointer as a sight (mouse = cursor, crosshair = 1): a ring with four
+ * ticks and a dot, in crosshair_color over a dark edge so it reads on sand
+ * and on shadow alike. Drawn here, antialiased, 32x32 with the hot spot in
+ * the middle. */
+static float sight_cover(float x, float y, float grow)
+{
+    float r = sqrtf(x * x + y * y), c = 0.0f, d;
+    float ax = fabsf(x), ay = fabsf(y);
+    d = fabsf(r - 8.5f) - (0.9f + grow);                      /* ring */
+    if (d < 0.5f) c = fmaxf(c, fminf(1.0f, 0.5f - d));
+    if (r < 1.6f + grow) c = fmaxf(c, fminf(1.0f, 1.6f + grow - r)); /* dot */
+    /* ticks: from r 4 to 13 on both axes, 1 px wide */
+    if (ax >= 4.0f - grow && ax <= 13.0f + grow) {
+        d = ay - (0.6f + grow);
+        if (d < 0.5f) c = fmaxf(c, fminf(1.0f, 0.5f - d));
+    }
+    if (ay >= 4.0f - grow && ay <= 13.0f + grow) {
+        d = ax - (0.6f + grow);
+        if (d < 0.5f) c = fmaxf(c, fminf(1.0f, 0.5f - d));
+    }
+    return c;
+}
+
+static HCURSOR mkb_sight_cursor(void)
+{
+    static HCURSOR cur;
+    BITMAPV5HEADER bh;
+    ICONINFO ii;
+    HBITMAP color, mask;
+    uint32_t *px = NULL;
+    HDC dc;
+    int x, y;
+    if (cur)
+        return cur;
+    memset(&bh, 0, sizeof bh);
+    bh.bV5Size = sizeof bh;
+    bh.bV5Width = 32;
+    bh.bV5Height = -32;
+    bh.bV5Planes = 1;
+    bh.bV5BitCount = 32;
+    bh.bV5Compression = BI_BITFIELDS;
+    bh.bV5RedMask = 0x00FF0000;
+    bh.bV5GreenMask = 0x0000FF00;
+    bh.bV5BlueMask = 0x000000FF;
+    bh.bV5AlphaMask = 0xFF000000;
+    dc = GetDC(NULL);
+    color = CreateDIBSection(dc, (BITMAPINFO *)&bh, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+    ReleaseDC(NULL, dc);
+    if (!color || !px)
+        return NULL;
+    for (y = 0; y < 32; y++)
+        for (x = 0; x < 32; x++) {
+            float fx = (float)x + 0.5f - 16.0f, fy = (float)y + 0.5f - 16.0f;
+            float fg = sight_cover(fx, fy, 0.0f), edge = sight_cover(fx, fy, 1.0f) * 0.75f;
+            float a = fg + edge * (1.0f - fg);
+            float r = (float)((s_cfg.crosshair_color >> 16) & 0xFF) * fg;
+            float g = (float)((s_cfg.crosshair_color >> 8) & 0xFF) * fg;
+            float b = (float)(s_cfg.crosshair_color & 0xFF) * fg;
+            /* premultiplied: the dark edge adds alpha, no colour */
+            px[y * 32 + x] = (uint32_t)(a * 255.0f + 0.5f) << 24
+                           | (uint32_t)(r + 0.5f) << 16 | (uint32_t)(g + 0.5f) << 8
+                           | (uint32_t)(b + 0.5f);
+        }
+    mask = CreateBitmap(32, 32, 1, 1, NULL);
+    memset(&ii, 0, sizeof ii);
+    ii.fIcon = FALSE;
+    ii.xHotspot = 16;
+    ii.yHotspot = 16;
+    ii.hbmMask = mask;
+    ii.hbmColor = color;
+    cur = (HCURSOR)CreateIconIndirect(&ii);
+    DeleteObject(color);
+    DeleteObject(mask);
+    return cur;
+}
+
+/* The game window's own pointer: the sight while captured in cursor mode,
+ * the arrow otherwise. The class cursor is what the window shows on every
+ * WM_SETCURSOR, whichever thread owns it. */
+static void mkb_set_sight(HWND hwnd, int on)
+{
+    static HWND set_on;
+    HCURSOR c;
+    if (on && (!s_cfg.crosshair || s_cfg.mouse != MKB_MOUSE_CURSOR))
+        on = 0;
+    if (on ? set_on == hwnd : !set_on)
+        return;
+    if (on) {
+        if (!(c = mkb_sight_cursor()))
+            return;
+        SetClassLongPtrA(hwnd, GCLP_HCURSOR, (LONG_PTR)c);
+        set_on = hwnd;
+    } else {
+        SetClassLongPtrA(set_on, GCLP_HCURSOR, (LONG_PTR)LoadCursorA(NULL, IDC_ARROW));
+        set_on = NULL;
+    }
+    /* Shown from the next mouse move; nudge it there now. */
+    {
+        POINT pt;
+        if (GetCursorPos(&pt))
+            SetCursorPos(pt.x, pt.y);
     }
 }
 
