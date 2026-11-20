@@ -3396,6 +3396,93 @@ static struct { uint32_t index, pos, gen; } s_vcache[XF_VCACHE];
 static uint32_t s_vcache_gen;
 static uint32_t s_vcache_hits, s_vcache_runs;      /* for the [PIPE] report */
 
+/* Vertex programs on several cores. A batch's vertices are independent:
+ * once the cache has decided which indices need running (serially -- it
+ * only looks at indices), those run on a small pool, then the cache hits are
+ * copied. The program, constants and attribute arrays are read-only while a
+ * batch runs (a program that writes constants, cxt_write, stays serial, as
+ * does a batch too small to be worth it). RECOMP_VSH_THREADS=n (0: off;
+ * default: cores / 2, at most 8). */
+#define VSH_PAR_MIN 384
+static struct {
+    int ok, n;
+    HANDLE go, done;
+    volatile LONG next, busy, failed;
+    uint32_t total;
+    const uint32_t *list;
+} s_vp;
+
+static void vsh_par_work(void)
+{
+    for (;;) {
+        LONG k = InterlockedExchangeAdd(&s_vp.next, 64), e;
+        if ((uint32_t)k >= s_vp.total)
+            break;
+        e = k + 64;
+        if ((uint32_t)e > s_vp.total)
+            e = (LONG)s_vp.total;
+        for (; k < e; k++) {
+            uint32_t i = s_vp.list[k];
+            if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+                InterlockedExchange(&s_vp.failed, 1);
+        }
+    }
+}
+
+static DWORD WINAPI vsh_par_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        WaitForSingleObject(s_vp.go, INFINITE);
+        vsh_par_work();
+        if (InterlockedDecrement(&s_vp.busy) == 0)
+            SetEvent(s_vp.done);
+    }
+    return 0;
+}
+
+static int vsh_par_init(void)
+{
+    static int tried;
+    if (!tried) {
+        const char *e = getenv("RECOMP_VSH_THREADS");
+        SYSTEM_INFO si;
+        int n, i;
+        tried = 1;
+        GetSystemInfo(&si);
+        n = e ? atoi(e) : (int)si.dwNumberOfProcessors / 2;
+        if (n > 8) n = 8;
+        if (n >= 1) {
+            s_vp.go = CreateSemaphoreA(NULL, 0, 64, NULL);
+            s_vp.done = CreateEventA(NULL, FALSE, FALSE, NULL);
+            for (i = 0; s_vp.go && s_vp.done && i < n; i++) {
+                HANDLE h = CreateThread(NULL, 0, vsh_par_thread, NULL, 0, NULL);
+                if (!h) break;
+                SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
+                CloseHandle(h);
+                s_vp.n++;
+            }
+            s_vp.ok = s_vp.n > 0;
+            fprintf(stderr, "[NV2A] vertex programs on %d extra threads\n", s_vp.n);
+        }
+    }
+    return s_vp.ok;
+}
+
+/* Run the listed batch positions on the pool (and this thread). 0: failed. */
+static int vsh_par_run(const uint32_t *list, uint32_t total)
+{
+    s_vp.list = list;
+    s_vp.total = total;
+    s_vp.next = 0;
+    s_vp.failed = 0;
+    s_vp.busy = s_vp.n;
+    ReleaseSemaphore(s_vp.go, s_vp.n, NULL);
+    vsh_par_work();
+    WaitForSingleObject(s_vp.done, INFINITE);
+    return !s_vp.failed;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
@@ -3412,6 +3499,39 @@ static void raster_batch_program(void)
         memset(s_vcache, 0, sizeof s_vcache);
         s_vcache_gen = 1;
     }
+    if (cache && n >= VSH_PAR_MIN && batch_uses_program() && vsh_par_init()) {
+        static uint32_t *list, *src;
+        uint32_t m = 0;
+        if (!list) {
+            list = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *list);
+            src = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *src);
+        }
+        if (list && src) {
+            for (i = 0; i < n; i++) {
+                uint32_t idx = s_gpu.idx[i], slot = (idx ^ (idx >> 12)) & (XF_VCACHE - 1);
+                if (s_vcache[slot].gen == s_vcache_gen && s_vcache[slot].index == idx) {
+                    src[i] = s_vcache[slot].pos;
+                    s_vcache_hits++;
+                    continue;
+                }
+                src[i] = i;
+                list[m++] = i;
+                s_vcache[slot].index = idx;
+                s_vcache[slot].pos = i;
+                s_vcache[slot].gen = s_vcache_gen;
+            }
+            s_vcache_runs += m;
+            /* The first one here: it decodes the program's slots. */
+            if (m && !transform_vertex(s_gpu.idx[list[0]], &s_xf[list[0]]))
+                return;
+            if (m > 1 && !vsh_par_run(list + 1, m - 1))
+                return;
+            for (i = 0; i < n; i++)
+                if (src[i] != i)
+                    s_xf[i] = s_xf[src[i]];
+            goto transformed;
+        }
+    }
     for (i = 0; i < n; i++) {
         uint32_t idx = s_gpu.idx[i], slot = (idx ^ (idx >> 12)) & (XF_VCACHE - 1);
         if (cache && s_vcache[slot].gen == s_vcache_gen
@@ -3427,6 +3547,7 @@ static void raster_batch_program(void)
         s_vcache[slot].pos = i;
         s_vcache[slot].gen = s_vcache_gen;
     }
+transformed:
     {
         /* RECOMP_SKIN_DUMP=<dir>: a skinned batch (its program indexes c[] by
          * a0) whose vertices spread over more than 160 surface pixels --
