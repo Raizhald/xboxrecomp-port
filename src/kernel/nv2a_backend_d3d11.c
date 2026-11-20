@@ -189,13 +189,43 @@ static const char k_hlsl[] =
 "  return saturate(o);\n"
 "}\n"
 /* rc_stage_fetch: what texture stage st contributes. */
-"float4 stage(Texture2D t, SamplerState sm, uint st, float4 c, inout bool keep) {\n"
+/* Where stage st samples, worked out before any branch so its screen-space
+ * derivatives can pick a mip level (SampleGrad; level 0 when the sampler's
+ * MaxLOD is 0, which is every filter mode but RECOMP_GPU_TEXFILTER=2). */
+"float2 suv(float4 c, uint st) {\n"
 "  uint mode = (g_fin.w >> (st * 5)) & 0x1F;\n"
 "  float q = (c.w != 0.0) ? c.w : 1.0;\n"
+"  if (mode == 3) return c.xy * g_tscale[st].xy;\n"
+"  return float2(c.x / q, c.y / q) * g_tscale[st].xy;\n"
+"}\n"
+/* B-spline bicubic from four bilinear taps, where the texture is magnified
+ * (RECOMP_GPU_TEXFILTER=2): a 32x32 ground texture spread over a quarter of
+ * the screen stops looking like blocks. Minified, the mips do the work. */
+"float4 bicubic(Texture2D t, SamplerState sm, float2 uv, float2 gx, float2 gy) {\n"
+"  float w, h, lv; t.GetDimensions(0, w, h, lv);\n"
+"  float2 sz = float2(w, h);\n"
+"  float2 d = max(abs(gx * sz), abs(gy * sz));\n"
+"  if (max(d.x, d.y) >= 1.0) return t.SampleGrad(sm, uv, gx, gy);\n"
+"  float2 p = uv * sz - 0.5, i = floor(p), f = p - i;\n"
+"  float2 f2 = f * f, f3 = f2 * f;\n"
+"  float2 w0 = (-f3 + 3.0 * f2 - 3.0 * f + 1.0) / 6.0;\n"
+"  float2 w1 = (3.0 * f3 - 6.0 * f2 + 4.0) / 6.0;\n"
+"  float2 w2 = (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0) / 6.0;\n"
+"  float2 w3 = f3 / 6.0;\n"
+"  float2 g0 = w0 + w1, g1 = w2 + w3;\n"
+"  float2 h0 = (i - 0.5 + w1 / g0) / sz, h1 = (i + 1.5 + w3 / g1) / sz;\n"
+"  float4 a = t.SampleGrad(sm, float2(h0.x, h0.y), gx, gy);\n"
+"  float4 b = t.SampleGrad(sm, float2(h1.x, h0.y), gx, gy);\n"
+"  float4 c = t.SampleGrad(sm, float2(h0.x, h1.y), gx, gy);\n"
+"  float4 e = t.SampleGrad(sm, float2(h1.x, h1.y), gx, gy);\n"
+"  return g0.y * (g0.x * a + g1.x * b) + g1.y * (g0.x * c + g1.x * e);\n"
+"}\n"
+"float4 stage(Texture2D t, SamplerState sm, uint st, float4 c, float2 uv, float2 gx,\n"
+"             float2 gy, inout bool keep) {\n"
+"  uint mode = (g_fin.w >> (st * 5)) & 0x1F;\n"
 "  if (mode == 0) return float4(0, 0, 0, 1);\n"
-"  if (mode == 1 || mode == 2)\n"
-"    return t.SampleLevel(sm, float2(c.x / q, c.y / q) * g_tscale[st].xy, 0);\n"
-"  if (mode == 3) return t.SampleLevel(sm, c.xy * g_tscale[st].xy, 0);\n"
+"  if (mode == 1 || mode == 2 || mode == 3)\n"
+"    return ((g_misc.y >> st) & 1) ? bicubic(t, sm, uv, gx, gy) : t.SampleGrad(sm, uv, gx, gy);\n"
 "  if (mode == 4) return saturate(c);\n"
 "  if (mode == 5) {\n"
 "    [unroll] for (uint j = 0; j < 4; j++) {\n"
@@ -220,17 +250,22 @@ static const char k_hlsl[] =
 "}\n"
 "float4 PSMain(PSIn i) : SV_Target {\n"
 "  float4 o;\n"
+"  float2 u0 = suv(i.t0, 0), u1 = suv(i.t1, 1), u2 = suv(i.t2, 2), u3 = suv(i.t3, 3);\n"
+"  float2 un = i.t0.xy * g_tscale[0].xy;\n"
+"  float2 x0 = ddx(u0), y0 = ddy(u0), x1 = ddx(u1), y1 = ddy(u1);\n"
+"  float2 x2 = ddx(u2), y2 = ddy(u2), x3 = ddx(u3), y3 = ddy(u3);\n"
+"  float2 xn = ddx(un), yn = ddy(un);\n"
 "  if (g_mode.x != 0) {\n"
 "    bool keep = true;\n"
-"    float4 t0 = stage(g_t0, g_s0, 0, i.t0, keep);\n"
-"    float4 t1 = stage(g_t1, g_s1, 1, i.t1, keep);\n"
-"    float4 t2 = stage(g_t2, g_s2, 2, i.t2, keep);\n"
-"    float4 t3 = stage(g_t3, g_s3, 3, i.t3, keep);\n"
+"    float4 t0 = stage(g_t0, g_s0, 0, i.t0, u0, x0, y0, keep);\n"
+"    float4 t1 = stage(g_t1, g_s1, 1, i.t1, u1, x1, y1, keep);\n"
+"    float4 t2 = stage(g_t2, g_s2, 2, i.t2, u2, x2, y2, keep);\n"
+"    float4 t3 = stage(g_t3, g_s3, 3, i.t3, u3, x3, y3, keep);\n"
 "    if (!keep) discard;\n"
 "    o = combine(i.d0, i.d1, float4(g_fogc.rgb, i.fog.x), t0, t1, t2, t3);\n"
 "  } else {\n"
 "    o = i.d0;\n"
-"    if (g_mode.y != 0) o *= g_t0.SampleLevel(g_s0, i.t0.xy * g_tscale[0].xy, 0);\n"
+"    if (g_mode.y != 0) o *= g_t0.SampleGrad(g_s0, un, xn, yn);\n"
 "    o = saturate(o);\n"
 "  }\n"
 "  if (g_mode.z != 0 && !alpha_pass(o.a)) discard;\n"
@@ -316,6 +351,12 @@ static struct {
      * pixels; only the textures, viewports, scissors and clear rectangles
      * grow. Read-back goes through a 1x copy (down_*). */
     uint32_t scale;
+    /* RECOMP_GPU_TEXFILTER: 0 as the title asks (nearest without
+     * combiners, like the software path); 1 "Smooth": textures the title
+     * filters linearly get mipmaps and trilinear filtering; 2 "Best": that
+     * plus bicubic (B-spline) magnification. Textures the title samples
+     * nearest -- HUD strips, lookup tables -- stay nearest in every mode. */
+    uint32_t texfilter;
     ID3D11Texture2D *down_tex;
     ID3D11RenderTargetView *down_rtv;
     uint32_t down_w, down_h;
@@ -510,6 +551,15 @@ static int g_init(void)
     G.check_every_bind = e && strcmp(e, "batch") == 0;
     e = getenv("RECOMP_GPU_TRACE");
     G.trace_frame = e ? (uint32_t)atoi(e) : 0;
+    e = getenv("RECOMP_GPU_TEXFILTER");
+    G.texfilter = e ? (uint32_t)atoi(e) : 0;
+    if (G.texfilter > 2) G.texfilter = 2;
+    if (G.texfilter) {
+        fprintf(stderr, "[GPUB] texture filtering: %s\n",
+                G.texfilter == 2 ? "mipmaps, trilinear, bicubic magnification"
+                                 : "mipmaps, trilinear");
+        fflush(stderr);
+    }
     e = getenv("RECOMP_GPU_SCALE");
     G.scale = e ? (uint32_t)atoi(e) : 1;
     if (G.scale < 1) G.scale = 1;
@@ -801,6 +851,33 @@ static void g_tex_upload(GTex *e, const Nv2aTexture *t)
     if (e->tex) {
         ID3D11DeviceContext_UpdateSubresource(G.ctx, (ID3D11Resource *)e->tex, 0,
                                               NULL, px, t->width * 4, 0);
+        if (G.texfilter && e->srv)
+            ID3D11DeviceContext_GenerateMips(G.ctx, e->srv);
+    } else if (G.texfilter) {
+        /* Full mip chain, built on the GPU from level 0. */
+        memset(&td, 0, sizeof td);
+        td.Width = t->width;
+        td.Height = t->height;
+        td.MipLevels = 0;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        hr = ID3D11Device_CreateTexture2D(G.dev, &td, NULL, &e->tex);
+        if (SUCCEEDED(hr))
+            hr = ID3D11Device_CreateShaderResourceView(G.dev, (ID3D11Resource *)e->tex,
+                                                       NULL, &e->srv);
+        if (SUCCEEDED(hr)) {
+            ID3D11DeviceContext_UpdateSubresource(G.ctx, (ID3D11Resource *)e->tex, 0,
+                                                  NULL, px, t->width * 4, 0);
+            ID3D11DeviceContext_GenerateMips(G.ctx, e->srv);
+        } else {
+            g_log_hr("texture (mips)", hr);
+            REL(e->srv);
+            REL(e->tex);
+        }
     } else {
         D3D11_SUBRESOURCE_DATA sd;
         memset(&td, 0, sizeof td);
@@ -922,6 +999,10 @@ static ID3D11SamplerState *g_sampler(int linear, uint32_t au, uint32_t av)
     if (i == 64)
         return G.samp[0].s;
     memset(&sd, 0, sizeof sd);
+    /* linear: 0 nearest, 1 bilinear (level 0), 2 trilinear over the mips.
+     * (D3D11_FILTER_ANISOTROPIC was tried for 2: on the RTX 5070 Laptop it
+     * magnified with nearest texels, which looked like no filtering at all;
+     * the camera here is nearly top-down, so anisotropy buys little.) */
     sd.Filter = linear ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
     sd.AddressU = map[au < 6 ? au : 0];
     sd.AddressV = map[av < 6 ? av : 0];
@@ -929,9 +1010,14 @@ static ID3D11SamplerState *g_sampler(int linear, uint32_t au, uint32_t av)
     sd.MaxAnisotropy = 1;
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sd.MinLOD = 0.0f;
-    sd.MaxLOD = 0.0f;
-    if (FAILED(ID3D11Device_CreateSamplerState(G.dev, &sd, &G.samp[i].s)))
-        return G.samp[0].s;
+    sd.MaxLOD = linear == 2 ? D3D11_FLOAT32_MAX : 0.0f;
+    {
+        HRESULT hr = ID3D11Device_CreateSamplerState(G.dev, &sd, &G.samp[i].s);
+        if (FAILED(hr)) {
+            g_log_hr("CreateSamplerState", hr);
+            return G.samp[0].s;
+        }
+    }
     G.samp[i].key = key;
     return G.samp[i].s;
 }
@@ -1196,6 +1282,7 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     cb->mode[2] = rs->alpha_test_enable ? (rs->alpha_func ? rs->alpha_func : 0x207) : 0;
     cb->mode[3] = rs->alpha_ref;
     cb->misc[0] = b->clip_plane_mode;
+    cb->misc[1] = 0;                    /* stages sampled bicubic (TEXFILTER 2) */
     for (st = 0; st < 4; st++) {
         const Nv2aTexture *t = use_rc ? b->stage[st] : (st == 0 ? b->texture : NULL);
         GRt *src = NULL;
@@ -1210,8 +1297,20 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
             srv[st] = g_self_copy(rt);
         {
             uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
+            /* MAG 2 / MIN 2,4,6 are linear; MAG 4 / MIN 7 are the NV2A's
+             * convolution (Gaussian) filter, used on the anti-aliased frame:
+             * linear is the closest D3D11 has (it was nearest before). */
+            int asked = mag == 2 || mag == 4 || min == 2 || min == 4 || min == 6 || min == 7;
             /* Without combiners the software path samples the nearest texel. */
-            int linear = use_rc && (mag == 2 || min == 2 || min == 4 || min == 6);
+            int linear = use_rc && asked;
+            /* RECOMP_GPU_TEXFILTER: what the title filters linearly gets
+             * mipmaps (1) and bicubic magnification too (2); what it asks to
+             * be sampled nearest (HUD strips, lookup tables) stays nearest. */
+            if (G.texfilter && linear && src == NULL) {
+                linear = 2;
+                if (G.texfilter == 2)
+                    cb->misc[1] |= 1u << st;
+            }
             smp[st] = g_sampler(linear, t->addr_u, t->addr_v);
         }
         /* To [0,1] over what is bound: raw normalised coordinates of a
@@ -1652,6 +1751,79 @@ static void g_present(GRt *rt)
     }
 }
 
+/* RECOMP_GPU_RT_DUMP=<dir>, RECOMP_GPU_RT_DUMP_AT=<s>[,<s>...]: the flipped
+ * render target at full (scaled) size as <dir>/rt-<s>.bmp, the first flip at
+ * or after each time (seconds since the first flip). No window needed: for
+ * comparing filtering and resolution settings headless. */
+static void g_rt_dump(GRt *rt)
+{
+    static int init, n, next;
+    static double at[16];
+    static const char *dir;
+    static LARGE_INTEGER t0, f;
+    LARGE_INTEGER now;
+    double secs;
+    if (!init) {
+        const char *e = getenv("RECOMP_GPU_RT_DUMP_AT");
+        init = 1;
+        dir = getenv("RECOMP_GPU_RT_DUMP");
+        while (e && *e && n < 16) {
+            at[n++] = atof(e);
+            e = strchr(e, ',');
+            if (e) e++;
+        }
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+    }
+    if (!dir || next >= n)
+        return;
+    QueryPerformanceCounter(&now);
+    secs = (double)(now.QuadPart - t0.QuadPart) / (double)f.QuadPart;
+    if (secs < at[next])
+        return;
+    {
+        D3D11_TEXTURE2D_DESC td;
+        ID3D11Texture2D *st = NULL;
+        D3D11_MAPPED_SUBRESOURCE m;
+        char path[512];
+        FILE *fp;
+        uint32_t y;
+        ID3D11Texture2D_GetDesc(rt->tex, &td);
+        td.Usage = D3D11_USAGE_STAGING;
+        td.BindFlags = 0;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        td.MiscFlags = 0;
+        td.MipLevels = 1;
+        if (FAILED(ID3D11Device_CreateTexture2D(G.dev, &td, NULL, &st)))
+            return;
+        ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)st, (ID3D11Resource *)rt->tex);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(G.ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0, &m))) {
+            snprintf(path, sizeof path, "%s/rt-%03d.bmp", dir, (int)at[next]);
+            if ((fp = fopen(path, "wb")) != NULL) {
+                uint8_t hd[54];
+                uint32_t sz = 54 + td.Width * td.Height * 4;
+                int32_t neg_h = -(int32_t)td.Height;
+                memset(hd, 0, sizeof hd);
+                hd[0] = 'B'; hd[1] = 'M';
+                memcpy(hd + 2, &sz, 4);
+                hd[10] = 54; hd[14] = 40;
+                memcpy(hd + 18, &td.Width, 4);
+                memcpy(hd + 22, &neg_h, 4);
+                hd[26] = 1; hd[28] = 32;
+                fwrite(hd, 1, 54, fp);
+                for (y = 0; y < td.Height; y++)
+                    fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, 4, td.Width, fp);
+                fclose(fp);
+                fprintf(stderr, "[GPUB] wrote %s (%ux%u)\n", path, td.Width, td.Height);
+                fflush(stderr);
+            }
+            ID3D11DeviceContext_Unmap(G.ctx, (ID3D11Resource *)st, 0);
+        }
+        REL(st);
+        next++;
+    }
+}
+
 static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
 {
     LARGE_INTEGER t0;
@@ -1663,6 +1835,7 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
     if (!rt || !pitch || (bpp != 2 && bpp != 4))
         return;
     g_time_begin(&t0);
+    g_rt_dump(rt);
     g_present(rt);
     if (P.sc && !P.readback) {
         G.n_resolves++;
