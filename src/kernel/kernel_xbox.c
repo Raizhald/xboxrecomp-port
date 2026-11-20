@@ -11,6 +11,8 @@
 
 #include "kernel.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ============================================================================
  * Exported Data Objects
@@ -145,9 +147,18 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_VIDEO:
-        /* NTSC with widescreen and HDTV support enabled */
+        /* NTSC with widescreen and HDTV support enabled.
+         * RECOMP_VIDEO_WIDESCREEN=0 reports a 4:3 set instead. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            const char *ws = getenv("RECOMP_VIDEO_WIDESCREEN");
+            static int logged;
+            *(PULONG)Value = (ws && atoi(ws) == 0 ? 0 : XC_VIDEO_FLAGS_WIDESCREEN)
+                             | XC_VIDEO_FLAGS_HDTV;
+            if (!logged++) {
+                fprintf(stderr, "  [KERNEL] video settings queried: 0x%08lX\n",
+                        (unsigned long)*(PULONG)Value);
+                fflush(stderr);
+            }
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

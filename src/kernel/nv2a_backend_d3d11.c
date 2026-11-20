@@ -72,6 +72,7 @@ static const char k_hlsl[] =
 "  uint4  g_cw[8];\n"       /* color_icw, color_ocw, alpha_icw, alpha_ocw */
 "  float4 g_f0[8];\n"
 "  float4 g_f1[8];\n"
+"  float4 g_wsx;\n"        /* x: added to pos.x * g_vp.x (widescreen offset) */
 "};\n"
 "Texture2D g_t0 : register(t0); Texture2D g_t1 : register(t1);\n"
 "Texture2D g_t2 : register(t2); Texture2D g_t3 : register(t3);\n"
@@ -93,7 +94,7 @@ static const char k_hlsl[] =
 "  PSIn o;\n"
 "  float w = 1.0;\n"
 "  if (g_vp.w != 0.0 && i.pos.w > 0.0) w = 1.0 / i.pos.w;\n"
-"  float x = i.pos.x * g_vp.x - 1.0;\n"
+"  float x = i.pos.x * g_vp.x + g_wsx.x;\n"
 "  float y = 1.0 - i.pos.y * g_vp.y;\n"
 "  float z = i.pos.z * g_vp.z;\n"
 "  o.pos = float4(x * w, y * w, z * w, w);\n"
@@ -195,8 +196,8 @@ static const char k_hlsl[] =
 "float2 suv(float4 c, uint st) {\n"
 "  uint mode = (g_fin.w >> (st * 5)) & 0x1F;\n"
 "  float q = (c.w != 0.0) ? c.w : 1.0;\n"
-"  if (mode == 3) return c.xy * g_tscale[st].xy;\n"
-"  return float2(c.x / q, c.y / q) * g_tscale[st].xy;\n"
+"  if (mode == 3) return c.xy * g_tscale[st].xy + g_tscale[st].zw;\n"
+"  return float2(c.x / q, c.y / q) * g_tscale[st].xy + g_tscale[st].zw;\n"
 "}\n"
 /* B-spline bicubic from four bilinear taps, where the texture is magnified
  * (RECOMP_GPU_TEXFILTER=2): a 32x32 ground texture spread over a quarter of
@@ -251,7 +252,7 @@ static const char k_hlsl[] =
 "float4 PSMain(PSIn i) : SV_Target {\n"
 "  float4 o;\n"
 "  float2 u0 = suv(i.t0, 0), u1 = suv(i.t1, 1), u2 = suv(i.t2, 2), u3 = suv(i.t3, 3);\n"
-"  float2 un = i.t0.xy * g_tscale[0].xy;\n"
+"  float2 un = i.t0.xy * g_tscale[0].xy + g_tscale[0].zw;\n"
 "  float2 x0 = ddx(u0), y0 = ddy(u0), x1 = ddx(u1), y1 = ddy(u1);\n"
 "  float2 x2 = ddx(u2), y2 = ddy(u2), x3 = ddx(u3), y3 = ddy(u3);\n"
 "  float2 xn = ddx(un), yn = ddy(un);\n"
@@ -286,6 +287,7 @@ typedef struct {
     float    fc0[4], fc1[4];
     uint32_t cw[8][4];
     float    f0[8][4], f1[8][4];
+    float    wsx[4];
 } GCB;
 
 #define G_MAX_RT    16
@@ -296,6 +298,10 @@ typedef struct {
 
 typedef struct {
     uint32_t va, w, h, bpp, pitch;
+    /* RECOMP_WIDESCREEN: the target is ew guest pixels wide (w when off);
+     * the guest's w-wide picture sits centred, ox pixels in. */
+    uint32_t ew;
+    float ox;
     /* What guest memory under the target held when the GPU copy was made
      * (or last written back). Drawing never changes guest memory, so a
      * different fingerprint means the CPU has put something else there. */
@@ -357,6 +363,9 @@ static struct {
      * plus bicubic (B-spline) magnification. Textures the title samples
      * nearest -- HUD strips, lookup tables -- stay nearest in every mode. */
     uint32_t texfilter;
+    /* RECOMP_WIDESCREEN: full-screen targets (480 lines, 4:3 or wider) are
+     * this much wider than the guest asks; 1.0 off. 16:9 is 4/3. */
+    float ws;
     ID3D11Texture2D *down_tex;
     ID3D11RenderTargetView *down_rtv;
     uint32_t down_w, down_h;
@@ -560,6 +569,20 @@ static int g_init(void)
                                  : "mipmaps, trilinear");
         fflush(stderr);
     }
+    G.ws = 1.0f;
+    e = getenv("RECOMP_WIDESCREEN");
+    if (e && *e && strcmp(e, "0") != 0) {
+        float a = 16.0f / 9.0f;
+        const char *c = strchr(e, ':');
+        if (c && atof(e) > 0.0 && atof(c + 1) > 0.0)
+            a = (float)(atof(e) / atof(c + 1));
+        if (a > 4.0f / 3.0f + 0.01f && a < 4.0f) {
+            G.ws = a * 3.0f / 4.0f;
+            fprintf(stderr, "[GPUB] widescreen: %.3f:1, full-screen targets %.3fx wider\n",
+                    a, G.ws);
+            fflush(stderr);
+        }
+    }
     e = getenv("RECOMP_GPU_SCALE");
     G.scale = e ? (uint32_t)atoi(e) : 1;
     if (G.scale < 1) G.scale = 1;
@@ -596,6 +619,17 @@ static void g_unpack_565(uint16_t t, uint8_t *bgra)
     bgra[3] = 0xFF;
 }
 
+/* RECOMP_WIDESCREEN: how wide a w x h target is drawn. Only the frame
+ * itself and the title's 2x anti-aliasing target (640 or 1280 x 480) widen;
+ * shadow maps, render-to-texture and anything smaller keep their size. */
+static uint32_t g_ws_width(uint32_t w, uint32_t h)
+{
+    if (G.ws <= 1.0f || h < 448 || w * 3 < h * 4)
+        return w;
+    w = (uint32_t)((float)w * G.ws + 0.5f);
+    return (w + 1) & ~1u;               /* even: the picture stays centred */
+}
+
 static int g_rt_create(GRt *r, uint32_t va, uint32_t w, uint32_t h,
                        uint32_t bpp, uint32_t pitch)
 {
@@ -624,15 +658,18 @@ static int g_rt_create(GRt *r, uint32_t va, uint32_t w, uint32_t h,
         sd.SysMemSlicePitch = w * h * 4;
         init = &sd;
     }
+    r->ew = g_ws_width(w, h);
+    r->ox = (float)(r->ew - w) * 0.5f;
     memset(&td, 0, sizeof td);
-    td.Width = w * G.scale;
+    td.Width = r->ew * G.scale;
     td.Height = h * G.scale;
     td.MipLevels = td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    hr = ID3D11Device_CreateTexture2D(G.dev, &td, G.scale == 1 ? init : NULL, &r->tex);
+    hr = ID3D11Device_CreateTexture2D(G.dev, &td,
+                                      G.scale == 1 && r->ew == w ? init : NULL, &r->tex);
     if (FAILED(hr)) { g_log_hr("CreateTexture2D(rt)", hr); free(px); return 0; }
     hr = ID3D11Device_CreateRenderTargetView(G.dev, (ID3D11Resource *)r->tex,
                                              NULL, &r->rtv);
@@ -641,9 +678,10 @@ static int g_rt_create(GRt *r, uint32_t va, uint32_t w, uint32_t h,
                                                NULL, &r->srv);
     if (FAILED(hr)) { g_log_hr("CreateShaderResourceView(rt)", hr);
                       REL(r->rtv); REL(r->tex); free(px); return 0; }
-    if (G.scale > 1) {
-        /* Guest contents at 1x, stretched (nearest) to the scaled target;
-         * otherwise a scaled target starts black. */
+    if (G.scale > 1 || r->ew != w) {
+        /* Guest contents at 1x, stretched (nearest) to the scaled target
+         * (centred in a wide one, black either side); otherwise a scaled
+         * target starts black. */
         ID3D11Texture2D *tmp = NULL;
         ID3D11ShaderResourceView *tsrv = NULL;
         float clr[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -656,8 +694,8 @@ static int g_rt_create(GRt *r, uint32_t va, uint32_t w, uint32_t h,
                 SUCCEEDED(ID3D11Device_CreateShaderResourceView(G.dev,
                               (ID3D11Resource *)tmp, NULL, &tsrv)) &&
                 g_blit_init())
-                g_blit(tsrv, r->rtv, 0.0f, 0.0f, (float)(w * G.scale),
-                       (float)(h * G.scale), 0);
+                g_blit(tsrv, r->rtv, r->ox * (float)G.scale, 0.0f,
+                       (float)(w * G.scale), (float)(h * G.scale), 0);
             REL(tsrv);
             REL(tmp);
         }
@@ -716,7 +754,7 @@ static GRt *g_rt_get(const Nv2aSurface *s)
         if (r->bpp == bpp) {
             D3D11_BOX box;
             box.left = 0; box.top = 0; box.front = 0;
-            box.right = (r->w < w ? r->w : w) * G.scale;
+            box.right = (r->ew < n.ew ? r->ew : n.ew) * G.scale;
             box.bottom = (r->h < h ? r->h : h) * G.scale;
             box.back = 1;
             ID3D11DeviceContext_CopySubresourceRegion(G.ctx, (ID3D11Resource *)n.tex,
@@ -1137,6 +1175,29 @@ static void g_time_end(const LARGE_INTEGER *t0)
 
 /* ---- Back end ---------------------------------------------------------- */
 
+/* The surface's clip rectangle in target pixels. In a widened target a
+ * clip covering the guest's whole width covers the whole target; a smaller
+ * one moves with the centred picture. */
+static void g_ws_rect(const GRt *rt, const Nv2aSurface *s, D3D11_RECT *r)
+{
+    float l = (float)s->clip_x, rr = (float)(s->clip_x + s->width);
+    if (rt->ew != rt->w) {
+        /* "Whole width" allows a pixel or two: this title clips its
+         * 1280-wide anti-aliased frame to 1278. */
+        uint32_t slack = rt->w / 128;
+        if (s->clip_x <= slack && s->clip_x + s->width + slack >= rt->w) {
+            rr = (float)rt->ew;
+        } else {
+            l += rt->ox;
+            rr += rt->ox;
+        }
+    }
+    r->left = (LONG)(l * (float)G.scale);
+    r->top = (LONG)(s->clip_y * G.scale);
+    r->right = (LONG)(rr * (float)G.scale);
+    r->bottom = (LONG)((s->clip_y + s->height) * G.scale);
+}
+
 static void g_bind_target(GRt *rt, ID3D11DepthStencilView *dsv,
                           const Nv2aSurface *s)
 {
@@ -1148,13 +1209,10 @@ static void g_bind_target(GRt *rt, ID3D11DepthStencilView *dsv,
     ID3D11DeviceContext_PSSetShaderResources(G.ctx, 0, 4, none);
     ID3D11DeviceContext_OMSetRenderTargets(G.ctx, 1, &rt->rtv, dsv);
     vp.TopLeftX = 0.0f; vp.TopLeftY = 0.0f;
-    vp.Width = (float)(rt->w * G.scale); vp.Height = (float)(rt->h * G.scale);
+    vp.Width = (float)(rt->ew * G.scale); vp.Height = (float)(rt->h * G.scale);
     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_RSSetViewports(G.ctx, 1, &vp);
-    sc.left = (LONG)(s->clip_x * G.scale);
-    sc.top = (LONG)(s->clip_y * G.scale);
-    sc.right = (LONG)((s->clip_x + s->width) * G.scale);
-    sc.bottom = (LONG)((s->clip_y + s->height) * G.scale);
+    g_ws_rect(rt, s, &sc);
     ID3D11DeviceContext_RSSetScissorRects(G.ctx, 1, &sc);
 }
 
@@ -1187,10 +1245,7 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
         }
         if (G.ctx1) {
             D3D11_RECT r;
-            r.left = (LONG)(s->clip_x * G.scale);
-            r.top = (LONG)(s->clip_y * G.scale);
-            r.right = (LONG)((s->clip_x + s->width) * G.scale);
-            r.bottom = (LONG)((s->clip_y + s->height) * G.scale);
+            g_ws_rect(rt, s, &r);
             ID3D11DeviceContext1_ClearView(G.ctx1, (ID3D11View *)rt->rtv, c, &r, 1);
         } else {
             ID3D11DeviceContext_ClearRenderTargetView(G.ctx, rt->rtv, c);
@@ -1198,7 +1253,7 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
     }
     if (flags & 0x01) {
         int fresh;
-        GDepth *d = g_depth_get(rs->zeta_va, rt->w, rt->h, &fresh);
+        GDepth *d = g_depth_get(rs->zeta_va, rt->ew, rt->h, &fresh);
         if (d) {
             float z = rs->zmax == 65535.0f ? (float)(zstencil & 0xFFFF)
                                            : (float)(zstencil >> 8);
@@ -1213,12 +1268,12 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
 /* A render target the batch is drawing into, as a texture it can sample. */
 static ID3D11ShaderResourceView *g_self_copy(GRt *rt)
 {
-    if (!G.copy_tex || G.copy_w != rt->w || G.copy_h != rt->h) {
+    if (!G.copy_tex || G.copy_w != rt->ew || G.copy_h != rt->h) {
         D3D11_TEXTURE2D_DESC td;
         REL(G.copy_srv);
         REL(G.copy_tex);
         memset(&td, 0, sizeof td);
-        td.Width = rt->w * G.scale;
+        td.Width = rt->ew * G.scale;
         td.Height = rt->h * G.scale;
         td.MipLevels = td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -1231,13 +1286,46 @@ static ID3D11ShaderResourceView *g_self_copy(GRt *rt)
             REL(G.copy_tex);
             return G.white;
         }
-        G.copy_w = rt->w;
+        G.copy_w = rt->ew;
         G.copy_h = rt->h;
     }
     ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)G.copy_tex,
                                      (ID3D11Resource *)rt->tex);
     G.n_selfcopy++;
     return G.copy_srv;
+}
+
+/* Does the batch cover exactly the guest's whole frame (one quad, corners
+ * on the frame's corners) with nothing 4:3 on it? Such a quad -- a fade, a
+ * full-screen tint, a pass over the widened frame itself -- is stretched
+ * over a widened target. A picture (a movie frame, a menu backdrop) is not:
+ * it stays 4:3 in the middle, black either side. */
+static int g_ws_fullscreen(const Nv2aBatch *b, const GRt *rt, int use_rc)
+{
+    uint32_t i;
+    int l = 0, r = 0, st;
+    if (b->count < 3 || b->count > 6)
+        return 0;
+    for (st = 0; st < 4; st++) {
+        const Nv2aTexture *t = use_rc ? b->stage[st] : (st == 0 ? b->texture : NULL);
+        const GRt *src;
+        if (!t)
+            continue;
+        if (use_rc && ((b->rc->stage_program >> (st * 5)) & 0x1F) == 0)
+            continue;                   /* stage off */
+        src = g_rt_find(t->offset);
+        if (!src || src->ew == src->w)
+            return 0;
+    }
+    for (i = 0; i < b->count; i++) {
+        float x = b->vertices[i].x, y = b->vertices[i].y;
+        if (y > 1.0f && y < (float)rt->h - 1.0f)
+            return 0;
+        if (x <= 1.0f) l = 1;
+        else if (x >= (float)rt->w - 1.0f) r = 1;
+        else return 0;
+    }
+    return l && r;
 }
 
 static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
@@ -1252,7 +1340,7 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     GCB *cb;
     float bf[4];
     uint32_t i, st, done;
-    int use_rc = b->rc != NULL && b->ext != NULL, fresh;
+    int use_rc = b->rc != NULL && b->ext != NULL, fresh, stretch;
 
     if (!b->count)
         return;
@@ -1263,7 +1351,7 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         return;
     }
     if (rs->depth_test_enable || rs->depth_write)
-        depth = g_depth_get(rs->zeta_va, rt->w, rt->h, &fresh);
+        depth = g_depth_get(rs->zeta_va, rt->ew, rt->h, &fresh);
     g_bind_target(rt, depth ? depth->dsv : NULL, s);
 
     if (FAILED(ID3D11DeviceContext_Map(G.ctx, (ID3D11Resource *)G.cb, 0,
@@ -1273,7 +1361,20 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     }
     cb = (GCB *)m.pData;
     memset(cb, 0, sizeof *cb);
-    cb->vp[0] = 2.0f / (float)rt->w;
+    stretch = rt->ew != rt->w && g_ws_fullscreen(b, rt, use_rc);
+
+    if (rt->ew == rt->w) {
+        cb->vp[0] = 2.0f / (float)rt->w;
+        cb->wsx[0] = -1.0f;
+    } else if (stretch) {
+        /* A quad over the whole guest frame (a fade, the anti-aliasing
+         * resolve, a backdrop) covers the whole wide target. */
+        cb->vp[0] = 2.0f / (float)rt->w;
+        cb->wsx[0] = -1.0f;
+    } else {
+        cb->vp[0] = 2.0f / (float)rt->ew;
+        cb->wsx[0] = 2.0f * rt->ox / (float)rt->ew - 1.0f;
+    }
     cb->vp[1] = 2.0f / (float)rt->h;
     cb->vp[2] = 1.0f / (rs->zmax > 0.0f ? rs->zmax : 16777215.0f);
     cb->vp[3] = b->ext ? 1.0f : 0.0f;  /* screen-space batches: linear */
@@ -1321,6 +1422,15 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         } else {
             cb->tscale[st][0] = 1.0f / tw;
             cb->tscale[st][1] = 1.0f / th;
+        }
+        if (src && src->ew != src->w) {
+            /* A widened target sampled: the guest's texels are the centred
+             * part, or -- drawn by a full-frame quad -- all of it. */
+            float k = (float)src->w / (float)src->ew;
+            if (!stretch) {
+                cb->tscale[st][0] *= k;
+                cb->tscale[st][2] = src->ox / (float)src->ew;
+            }
         }
     }
     if (use_rc) {
@@ -1728,13 +1838,16 @@ static void g_present(GRt *rt)
         if (FAILED(hr))
             return;
     }
-    /* 4:3, centred, black bars. */
-    aw = (float)w;
-    ah = (float)h;
-    if (aw * 3.0f > ah * 4.0f)
-        aw = ah * 4.0f / 3.0f;
-    else
-        ah = aw * 3.0f / 4.0f;
+    /* 4:3 (or the widened target's shape), centred, black bars. */
+    {
+        float ra = 4.0f / 3.0f * (float)rt->ew / (float)rt->w;
+        aw = (float)w;
+        ah = (float)h;
+        if (aw > ah * ra)
+            aw = ah * ra;
+        else
+            ah = aw / ra;
+    }
     vp.TopLeftX = ((float)w - aw) * 0.5f;
     vp.TopLeftY = ((float)h - ah) * 0.5f;
     vp.Width = aw;
@@ -1868,7 +1981,7 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
         G.staging_w = rt->w;
         G.staging_h = rt->h;
     }
-    if (G.scale > 1) {
+    if (G.scale > 1 || rt->ew != rt->w) {
         /* Back to guest size first (linear filter averages the scaled
          * pixels), then into the staging copy as at 1x. */
         if (!G.down_tex || G.down_w != rt->w || G.down_h != rt->h) {
@@ -1895,7 +2008,8 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
             G.down_w = rt->w;
             G.down_h = rt->h;
         }
-        g_blit(rt->srv, G.down_rtv, 0.0f, 0.0f, (float)rt->w, (float)rt->h, 1);
+        /* A widened target gives the guest its centred part. */
+        g_blit(rt->srv, G.down_rtv, -rt->ox, 0.0f, (float)rt->ew, (float)rt->h, 1);
         ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)G.staging,
                                          (ID3D11Resource *)G.down_tex);
     } else {

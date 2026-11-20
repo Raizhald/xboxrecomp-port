@@ -397,12 +397,24 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         RECT wa;
         const char *e = getenv("RECOMP_WINDOW_SCALE");
         int scale = e ? atoi(e) : 2;
+        /* RECOMP_WIDESCREEN (the GPU back end draws wider): the window opens
+         * at that shape, 854x480 a step for 16:9. */
+        LONG fw = (LONG)s_fb_width;
+        const char *ws = getenv("RECOMP_WIDESCREEN");
+        if (ws && *ws && strcmp(ws, "0") != 0) {
+            double a = 16.0 / 9.0;
+            const char *c = strchr(ws, ':');
+            if (c && atof(ws) > 0.0 && atof(c + 1) > 0.0)
+                a = atof(ws) / atof(c + 1);
+            if (a > 4.0 / 3.0 + 0.01 && a < 4.0)
+                fw = (LONG)((double)s_fb_height * a + 0.5);
+        }
         if (scale < 1) scale = 1;
         if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0))
             SetRect(&wa, 0, 0, 1024, 768);
         for (; scale > 1; scale--) {
             r.left = 0; r.top = 0;
-            r.right = (LONG)s_fb_width * scale;
+            r.right = fw * scale;
             r.bottom = (LONG)s_fb_height * scale;
             AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
             if (r.right - r.left <= wa.right - wa.left &&
@@ -410,7 +422,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 break;
         }
         r.left = 0; r.top = 0;
-        r.right = (LONG)s_fb_width * scale;
+        r.right = fw * scale;
         r.bottom = (LONG)s_fb_height * scale;
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     }
