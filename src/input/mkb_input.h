@@ -51,6 +51,27 @@ int mkb_enabled(void);
  */
 int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
+/*
+ * mouse = cursor: the pointer stays visible and free, and every poll tells
+ * the title where it is -- for a title (or its port) that turns the player
+ * toward it. x, y are the pointer in the game window's client area as
+ * fractions (0..1, may fall outside when the pointer is off the window),
+ * aspect is the client area's width / height. active is 0 when the game is
+ * not in the foreground or the layer is released (F9); the hook is then
+ * called once and not again until it is active. Called on the thread that
+ * polls the pad, i.e. the title's.
+ *
+ * RECOMP_MKB_CURSOR_TEST=x,y[,aspect] fakes a pointer there, foreground or
+ * not: for headless tests of what the title does with it.
+ */
+typedef void (*mkb_cursor_hook)(int active, float x, float y, float aspect);
+void mkb_set_cursor_hook(mkb_cursor_hook fn);
+
+/* Whether a binding to the pad input named like in the config ("a", "rt",
+ * "lup", "walk") was held at the last poll -- for a cursor hook that acts
+ * differently while, say, the attack button is down. */
+int mkb_target_held(const char *target);
+
 #ifdef __cplusplus
 }
 #endif

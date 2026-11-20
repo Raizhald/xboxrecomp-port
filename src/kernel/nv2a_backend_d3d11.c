@@ -2087,10 +2087,44 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
     g_time_end(&t0);
 }
 
+/* RECOMP_MEMDUMP_DIR: a debugging aid for finding game variables. When a
+ * file <dir>/req appears (a harness writes it), the first line names a dump:
+ * the guest's 64 MB of RAM goes to <dir>/<name>.bin and req is removed.
+ * Checked every 10 frames. */
+static void g_memdump_poll(void)
+{
+    static const char *dir = (const char *)-1;
+    char path[512], name[128], out[700];
+    FILE *f;
+    if (dir == (const char *)-1)
+        dir = getenv("RECOMP_MEMDUMP_DIR");
+    if (!dir || G.frame % 10)
+        return;
+    snprintf(path, sizeof path, "%s/req", dir);
+    if (!(f = fopen(path, "r")))
+        return;
+    name[0] = 0;
+    if (!fgets(name, sizeof name, f))
+        name[0] = 0;
+    fclose(f);
+    DeleteFileA(path);
+    name[strcspn(name, "\r\n")] = 0;
+    if (!name[0])
+        return;
+    snprintf(out, sizeof out, "%s/%s.bin", dir, name);
+    if ((f = fopen(out, "wb")) != NULL) {
+        fwrite(nv2a_backend_guest(0), 1, 64u << 20, f);
+        fclose(f);
+        fprintf(stderr, "[GPUB] memdump %s (frame %u)\n", out, G.frame);
+        fflush(stderr);
+    }
+}
+
 static void gb_flip(void)
 {
     int i;
     G.frame++;
+    g_memdump_poll();
     /* A surface nothing has drawn into for ~10 s gives its address back to
      * guest memory: the title may have reused it for something else. */
     for (i = 0; i < G_MAX_RT; i++)

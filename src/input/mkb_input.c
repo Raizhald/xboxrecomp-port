@@ -53,7 +53,7 @@ typedef struct {
     double walk;        /* left stick length while "walk" is held    */
 } MkbConfig;
 
-enum { MKB_MOUSE_AIM, MKB_MOUSE_DRAG, MKB_MOUSE_OFF };
+enum { MKB_MOUSE_AIM, MKB_MOUSE_DRAG, MKB_MOUSE_OFF, MKB_MOUSE_CURSOR };
 
 static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 8, 0, 0, MKB_MOUSE_AIM, 4, 0, 0.5 };
 
@@ -198,7 +198,8 @@ static int mkb_apply_kv(const char *key, const char *val)
         s_cfg.swap_sticks = atoi(val) != 0;
     } else if (!strcmp(key, "mouse")) {
         s_cfg.mouse = !_stricmp(val, "drag") ? MKB_MOUSE_DRAG
-                    : !_stricmp(val, "off") ? MKB_MOUSE_OFF : MKB_MOUSE_AIM;
+                    : !_stricmp(val, "off") ? MKB_MOUSE_OFF
+                    : !_stricmp(val, "cursor") ? MKB_MOUSE_CURSOR : MKB_MOUSE_AIM;
     } else if (!strcmp(key, "drag_button")) {
         l = mkb_src_parse(val) - MKB_SRC_MOUSE;
         if (l >= 0 && l < 5) s_cfg.drag_btn = 1 << l;
@@ -479,9 +480,18 @@ static void mkb_manage_cursor(int capture)
     if (capture) {
         RECT r;
         HWND fg = GetForegroundWindow();
-        if (fg && GetWindowRect(fg, &r))
+        if (fg && GetClientRect(fg, &r)) {
+            /* Client area in screen coordinates: the pointer cannot leave
+             * the picture for the title bar or another app. */
+            POINT a = { r.left, r.top }, b = { r.right, r.bottom };
+            ClientToScreen(fg, &a);
+            ClientToScreen(fg, &b);
+            SetRect(&r, a.x, a.y, b.x, b.y);
             ClipCursor(&r);
-        if (hidden < 5) { ShowCursor(FALSE); hidden++; }
+        }
+        /* A cursor the title aims at stays visible. */
+        if (s_cfg.mouse != MKB_MOUSE_CURSOR && hidden < 5) { ShowCursor(FALSE); hidden++; }
+        if (s_cfg.mouse == MKB_MOUSE_CURSOR && hidden > 0) { ShowCursor(TRUE); hidden--; }
     } else {
         if (hidden > 0) { ShowCursor(TRUE); hidden--; }
         ClipCursor(NULL);
@@ -508,6 +518,52 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
     *out_x = (SHORT)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
     v = (long)(fy * 32767.0);
     *out_y = (SHORT)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+}
+
+static unsigned char s_target_held[MKB_T_WALK + 1];
+
+int mkb_target_held(const char *target)
+{
+    int t = mkb_target_parse(target);
+    return t >= 0 ? s_target_held[t] : 0;
+}
+
+static mkb_cursor_hook s_cursor_hook;
+void mkb_set_cursor_hook(mkb_cursor_hook fn) { s_cursor_hook = fn; }
+
+/* Tell the title where the pointer is (mouse = cursor). */
+static void mkb_cursor_report(int active)
+{
+    static int was_active;
+    static int test = -1;
+    static float tx, ty, ta = 4.0f / 3.0f;
+    POINT pt;
+    RECT rc;
+    HWND hwnd;
+
+    if (!s_cursor_hook)
+        return;
+    if (test < 0) {
+        const char *e = getenv("RECOMP_MKB_CURSOR_TEST");
+        test = e && sscanf(e, "%f,%f,%f", &tx, &ty, &ta) >= 2;
+    }
+    if (test) {
+        s_cursor_hook(1, tx, ty, ta);
+        return;
+    }
+    if (!active || s_cfg.mouse != MKB_MOUSE_CURSOR) {
+        if (was_active)
+            s_cursor_hook(0, 0.0f, 0.0f, 1.0f);
+        was_active = 0;
+        return;
+    }
+    hwnd = GetForegroundWindow();
+    if (!hwnd || !GetCursorPos(&pt) || !ScreenToClient(hwnd, &pt)
+        || !GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0)
+        return;
+    was_active = 1;
+    s_cursor_hook(1, (float)pt.x / (float)rc.right, (float)pt.y / (float)rc.bottom,
+                  (float)rc.right / (float)rc.bottom);
 }
 
 #define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
@@ -558,6 +614,7 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     if (!s_active) {
         mkb_manage_cursor(0);
+        mkb_cursor_report(0);
         return 0;
     }
 
@@ -565,6 +622,8 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
      * whoever has it, and the game should read a pad at rest. */
     if (!game_is_foreground()) {
         mkb_manage_cursor(0);
+        memset(s_target_held, 0, sizeof s_target_held);
+        mkb_cursor_report(0);
         InterlockedExchange(&s_dx, 0);
         InterlockedExchange(&s_dy, 0);
         InterlockedExchange(&s_wheel, 0);
@@ -589,6 +648,7 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     memset(analog, 0, sizeof analog);
     memset(stick, 0, sizeof stick);
+    memset(s_target_held, 0, sizeof s_target_held);
 
     /* ---- bindings ---- */
     for (i = 0; i < s_nbind; i++) {
@@ -601,6 +661,7 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
             held = wheel_on[src == MKB_SRC_WHEEL_DOWN];
         if (!held)
             continue;
+        s_target_held[t] = 1;
         if (t < MKB_T_DIGITAL)
             analog[t] = 255;
         else if (t < MKB_T_STICK)
@@ -631,12 +692,13 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
     }
 
     /* ---- mouse movement ---- */
+    /* aim: always; drag and cursor: while the drag button is held. */
     if ((dx || dy) && s_cfg.mouse != MKB_MOUSE_OFF &&
         (s_cfg.mouse == MKB_MOUSE_AIM || (btn & s_cfg.drag_btn))) {
         double ax =  (double)dx / (double)s_cfg.full;
         double ay = -(double)dy / (double)s_cfg.full;
         if (s_cfg.invert_y) ay = -ay;
-        if (s_cfg.mouse == MKB_MOUSE_DRAG && !s_cfg.drag_y) ay = 0.0;
+        if (s_cfg.mouse != MKB_MOUSE_AIM && !s_cfg.drag_y) ay = 0.0;
         mkb_aim_vector(ax, ay, &aim_x, &aim_y);
     }
     if (!aim_x && !aim_y) {
@@ -673,6 +735,8 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
         }
         any = 1;
     }
+
+    mkb_cursor_report(1);
 
     /* Edge detection: a title polling for changes ignores a state whose
      * packet number did not move. */
