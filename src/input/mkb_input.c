@@ -89,6 +89,13 @@ typedef struct { short src, target; } MkbBind;
 static MkbBind s_bind[MKB_MAX_BINDS];
 static int s_nbind, s_bind_custom;
 
+/* "autofire = a[+b...]": while an input bound to one of these is held, the
+ * pad button is pressed and released repeatedly ("autofire_rate" presses a
+ * second, default 6), first press at once -- for titles that attack once
+ * per press. */
+static unsigned char s_autofire[MKB_T_WALK + 1];
+static double s_autofire_rate = 6.0;
+
 static int mkb_src_parse(const char *k)
 {
     static const struct { const char *n; int v; } names[] = {
@@ -211,6 +218,16 @@ static int mkb_apply_kv(const char *key, const char *val)
         s_cfg.crosshair = atoi(val) != 0;
     } else if (!strcmp(key, "crosshair_color")) {
         s_cfg.crosshair_color = (unsigned)strtoul(val, NULL, 16) & 0xFFFFFFu;
+    } else if (!strcmp(key, "autofire")) {
+        char buf[128], *tok, *ctx = NULL;
+        memset(s_autofire, 0, sizeof s_autofire);
+        strncpy(buf, val, sizeof buf - 1); buf[sizeof buf - 1] = 0;
+        for (tok = strtok_s(buf, "+, ", &ctx); tok; tok = strtok_s(NULL, "+, ", &ctx)) {
+            int t = mkb_target_parse(tok);
+            if (t >= 0 && t < MKB_T_STICK) s_autofire[t] = 1;
+        }
+    } else if (!strcmp(key, "autofire_rate")) {
+        d = strtod(val, NULL); if (d >= 1.0 && d <= 30.0) s_autofire_rate = d;
     } else if (!strcmp(key, "walk")) {
         d = strtod(val, NULL); if (d > 0.0 && d <= 1.0) s_cfg.walk = d;
     } else {
@@ -711,6 +728,43 @@ static int wheel_pulse(int dir, LONG steps)
     return 0;
 }
 
+/* Autofire for a real pad: the same "autofire" buttons, held on the
+ * controller, are pressed and released at autofire_rate. Only the pad's own
+ * state goes through here (before keyboard and mouse merge in). */
+void mkb_autofire_pad(XBOX_INPUT_STATE *pState)
+{
+    static unsigned char was[MKB_T_STICK];
+    static DWORD since[MKB_T_STICK];
+    DWORD period, now;
+    int t, held;
+
+    if (!pState || !mkb_enabled())
+        return;
+    period = (DWORD)(1000.0 / s_autofire_rate);
+    now = GetTickCount();
+    for (t = 0; t < MKB_T_STICK; t++) {
+        if (!s_autofire[t])
+            continue;
+        held = t < MKB_T_DIGITAL
+             ? pState->Gamepad.bAnalogButtons[t] > 30
+             : (pState->Gamepad.wButtons >> (t - MKB_T_DIGITAL)) & 1;
+        if (!held) {
+            was[t] = 0;
+            continue;
+        }
+        if (!was[t]) {
+            was[t] = 1;
+            since[t] = now;
+        }
+        if ((now - since[t]) % period < period / 2)
+            continue;
+        if (t < MKB_T_DIGITAL)
+            pState->Gamepad.bAnalogButtons[t] = 0;
+        else
+            pState->Gamepad.wButtons &= (WORD)~(1u << (t - MKB_T_DIGITAL));
+    }
+}
+
 int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     SHORT aim_x = 0, aim_y = 0, mov_x = 0, mov_y = 0, rs_x = 0, rs_y = 0;
@@ -720,6 +774,9 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
     int any = 0, i, walk = 0, wheel_on[2];
     int stick[8];
     unsigned char tap[256];
+    unsigned char af_now[MKB_T_WALK + 1];
+    static unsigned char s_af_was[MKB_T_WALK + 1];
+    static DWORD s_af_since[MKB_T_WALK + 1];
     static DWORD packet;
 
     if (!pState || dwPort != 0 || !mkb_enabled())
@@ -766,6 +823,7 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
     memset(s_target_held, 0, sizeof s_target_held);
 
     /* ---- bindings ---- */
+    memset(af_now, 0, sizeof af_now);
     for (i = 0; i < s_nbind; i++) {
         int src = s_bind[i].src, t = s_bind[i].target, held;
         if (src < 256)
@@ -777,6 +835,15 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
         if (!held)
             continue;
         s_target_held[t] = 1;
+        if (s_autofire[t]) {
+            /* On for the first half of each period, counted from the press. */
+            DWORD period = (DWORD)(1000.0 / s_autofire_rate);
+            af_now[t] = 1;
+            if (!s_af_was[t])
+                s_af_since[t] = GetTickCount();
+            if ((GetTickCount() - s_af_since[t]) % period >= period / 2)
+                continue;
+        }
         if (t < MKB_T_DIGITAL)
             analog[t] = 255;
         else if (t < MKB_T_STICK)
@@ -786,6 +853,8 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
         else
             walk = 1;
     }
+
+    memcpy(s_af_was, af_now, sizeof s_af_was);
 
     /* ---- keys on the sticks: full throw, opposite keys cancel ---- */
     {

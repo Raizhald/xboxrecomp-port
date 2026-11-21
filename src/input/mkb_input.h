@@ -51,6 +51,10 @@ int mkb_enabled(void);
  */
 int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
+/* "autofire" from the config, applied to a real pad's state: the listed
+ * buttons, while held, are pressed and released at autofire_rate. */
+void mkb_autofire_pad(XBOX_INPUT_STATE *pState);
+
 /*
  * mouse = cursor: the pointer stays visible and free, and every poll tells
  * the title where it is -- for a title (or its port) that turns the player

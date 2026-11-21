@@ -124,6 +124,9 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
 
     if (dwPort == 0)
+        mkb_autofire_pad(pState);
+
+    if (dwPort == 0)
         keyboard_merge(pState);
 
     /* Mouse+keyboard merges on top of a real pad too: the mouse owns the
