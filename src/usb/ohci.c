@@ -431,6 +431,8 @@ static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
 
 /* Pads plugged in so far, in port order. */
 static int s_plugged_pads;
+/* Pad 1 pulled out by RECOMP_USB_REPLUG and not back yet: it answers nothing. */
+static volatile int s_pad0_out;
 
 /* Which pad an endpoint descriptor talks to: by its function address, and
  * address 0 -- the default address a device answers before SET_ADDRESS --
@@ -442,7 +444,9 @@ static int ohci_pad_for(uint32_t ed0)
     uint32_t fa = ed0 & 0x7Fu;
     int d;
     for (d = 0; d < s_plugged_pads; d++)
-        if (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0)
+        if (d == 0 && s_pad0_out)
+            continue;
+        else if (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0)
             return d;
     return -1;
 }
@@ -1095,6 +1099,44 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                 fflush(stderr);
                 s_plugged_pads++;
                 settle = 0;
+            }
+        }
+
+        /* RECOMP_USB_REPLUG=<seconds>: pull pad 1 out that long after it
+         * first arrived and plug it back in a second later -- what a player
+         * does on a console when a title asks for the controller to be
+         * reconnected. A title that binds its player to a pad when the pad
+         * arrives (rather than polling for one already there) only sees a
+         * pad that arrives; the level warp skips the screen that binds it. */
+        if (plugged) {
+            /* Wall-clock time, not loop passes: Sleep(OHCI_TICK_MS) lasts a
+             * scheduler quantum (~15 ms) on a default Windows timer, not 4. */
+            static int rp_state;            /* 0 unread, 1 armed, 2 out, 3 done */
+            static ULONGLONG rp_at;
+            if (rp_state == 0) {
+                const char *e = getenv("RECOMP_USB_REPLUG");
+                double sec = e ? atof(e) : 0.0;
+                rp_at = GetTickCount64() + (ULONGLONG)(sec * 1000.0);
+                rp_state = sec > 0 ? 1 : 3;
+            }
+            if (rp_state < 3 && GetTickCount64() >= rp_at) {
+                uint32_t *ps = &hc->reg[(HcRhPortStatus1 + first_port * 4) / 4];
+                if (rp_state == 1) {
+                    s_pad0_out = 1;
+                    usb_gamepad_detach(0);
+                    *ps &= ~(PORT_CCS | PORT_PES);
+                    *ps |= PORT_CSC;
+                    rp_state = 2;
+                    rp_at = GetTickCount64() + 1000u;
+                    fprintf(stderr, "  [OHCI0] pad 1 pulled out (RECOMP_USB_REPLUG)\n");
+                } else {
+                    s_pad0_out = 0;
+                    *ps |= PORT_CCS | PORT_CSC;
+                    rp_state = 3;
+                    fprintf(stderr, "  [OHCI0] pad 1 plugged back in\n");
+                }
+                fflush(stderr);
+                hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
             }
         }
 

@@ -563,6 +563,43 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     if (!s_initialized)
         xbox_path_init(NULL, NULL);
 
+    /* RECOMP_PATH_OVERRIDE=<tail>=<host file>[;...]: an Xbox path ending in
+     * <tail> (case ignored, '\\' or '/') opens that host file instead -- for
+     * tests that need a title to read a different small file (a launch
+     * arguments file, say) without touching the game data. */
+    {
+        const char *ov = getenv("RECOMP_PATH_OVERRIDE");
+        while (ov && *ov) {
+            const char *eq = strchr(ov, '='), *end = strchr(ov, ';');
+            size_t tl, pl = strlen(xbox_path);
+            if (!end) end = ov + strlen(ov);
+            if (!eq || eq > end) break;
+            tl = (size_t)(eq - ov);
+            if (tl && tl <= pl) {
+                size_t k;
+                int same = 1;
+                for (k = 0; k < tl && same; k++) {
+                    char x = xbox_path[pl - tl + k], y = ov[k];
+                    if (x == '/') x = '\\';
+                    if (y == '/') y = '\\';
+                    same = tolower((unsigned char)x) == tolower((unsigned char)y);
+                }
+                if (same) {
+                    char host[MAX_PATH];
+                    size_t hl = (size_t)(end - eq - 1);
+                    if (hl >= sizeof host) hl = sizeof host - 1;
+                    memcpy(host, eq + 1, hl);
+                    host[hl] = 0;
+                    MultiByteToWideChar(CP_ACP, 0, host, -1, host_path_buf, buf_size);
+                    fprintf(stderr, "  [PATH] %s -> override %s\n", xbox_path, host);
+                    fflush(stderr);
+                    return TRUE;
+                }
+            }
+            ov = *end ? end + 1 : end;
+        }
+    }
+
     {
         char linked[512];
         if (resolve_symlink(xbox_path, linked, sizeof(linked)))

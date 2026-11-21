@@ -40,6 +40,8 @@ int usb_gamepad_report(int pad, uint8_t *out, int max);
  * and whether it has been configured. */
 uint8_t usb_gamepad_address(int pad);
 int usb_gamepad_configured(int pad);
+/* Back to the unaddressed, unconfigured state of a pad just plugged in. */
+void usb_gamepad_detach(int pad);
 
 /* Up to four pads, one per Xbox controller port. Pad n is driven by host
  * XInput pad n and by pad-script steps prefixed "p<n+1>-". */
