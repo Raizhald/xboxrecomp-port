@@ -1716,7 +1716,37 @@ static void bridge_ExQueryNonVolatileSetting(void)
     uint32_t value_length = STACK_ARG(3);
     uint32_t result_va    = STACK_ARG(4);
 
-    NTSTATUS st = xbox_ExQueryNonVolatileSetting(
+    NTSTATUS st;
+
+    /* A burst of these is not normal (a title asks a handful of times), and
+     * one preceded a player's hang: name the guest code on the stack once,
+     * so the next report says where the loop is. Return addresses are the
+     * stack words that point into the image's code below 0x00100000. */
+    {
+        static DWORD win_start;
+        static unsigned win_calls;
+        static int reported;
+        DWORD now = GetTickCount();
+        if (now - win_start > 1000) { win_start = now; win_calls = 0; }
+        if (++win_calls > 2000 && !reported) {
+            uint32_t k, n = 0;
+            reported = 1;
+            fprintf(stderr, "[KERNEL] ExQueryNonVolatileSetting(0x%X) called %u times "
+                            "within a second; guest stack (code addresses):",
+                    value_index, win_calls);
+            for (k = 0; k < 512 && n < 32; k++) {
+                uint32_t v = BRIDGE_MEM32(g_esp + k * 4);
+                if (v >= 0x00011000u && v < 0x000A6060u) {
+                    fprintf(stderr, " %08X", v);
+                    n++;
+                }
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
+    }
+
+    st = xbox_ExQueryNonVolatileSetting(
         value_index,
         type_va   ? (PULONG)&BRIDGE_MEM32(type_va)   : NULL,
         value_va  ? (PVOID)((uintptr_t)value_va + g_xbox_mem_offset) : NULL,
