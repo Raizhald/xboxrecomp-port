@@ -330,6 +330,19 @@ typedef struct {
     ID3D11ShaderResourceView *srv;      /* NULL: could not decode (white) */
 } GTex;
 
+/* RECOMP_GPU_READBACK=2 (default): the flipped frame is copied back to guest
+ * memory one or two flips late, through a ring of staging textures mapped
+ * only once the GPU has finished them. Mapping at once (=1, the old way)
+ * made the CPU wait for the whole frame to be drawn at every flip: in 16:9
+ * that halved the frame rate (bar 45 -> 59 FPS without read-back). */
+#define G_RB_N 3
+typedef struct {
+    ID3D11Texture2D *tex;
+    uint32_t w, h;                      /* staging size */
+    int pending;
+    uint32_t va, pitch, bpp, cw, ch, frame;
+} GRb;
+
 static struct {
     int tried, ok;
     ID3D11Device *dev;
@@ -350,8 +363,9 @@ static struct {
     ID3D11Texture2D *copy_tex;
     ID3D11ShaderResourceView *copy_srv;
     uint32_t copy_w, copy_h;
-    ID3D11Texture2D *staging;
-    uint32_t staging_w, staging_h;
+    /* Read-back ring (gb_resolve, rb_finish). */
+    GRb rb[G_RB_N];
+    uint32_t rb_next;
     /* RECOMP_GPU_SCALE: render targets and depth buffers are this many times
      * the guest size in each direction. Everything the guest sees (vertex
      * positions, texel scales, sizes in logs, read-back) stays in guest
@@ -859,11 +873,28 @@ static GDepth *g_depth_get(uint32_t va, uint32_t w, uint32_t h, int *fresh)
 
 /* ---- Textures ---------------------------------------------------------- */
 
+/* Change detection only (never stored): four independent lanes so the
+ * multiply chains overlap -- one chain ran at ~6 GB/s, and 16:9 hashes
+ * ~8 MB of textures and targets a frame. */
 static uint64_t g_hash(const uint8_t *p, uint32_t n, uint64_t h)
 {
     uint32_t i;
+    uint64_t h0, h1, h2, h3;
     h ^= 0x9E3779B97F4A7C15ull + n;
-    for (i = 0; i + 8 <= n; i += 8) {
+    h0 = h; h1 = h ^ 0x6A09E667F3BCC909ull;
+    h2 = h ^ 0xBB67AE8584CAA73Bull; h3 = h ^ 0x3C6EF372FE94F82Bull;
+    for (i = 0; i + 32 <= n; i += 32) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, p + i, 8); memcpy(&w1, p + i + 8, 8);
+        memcpy(&w2, p + i + 16, 8); memcpy(&w3, p + i + 24, 8);
+        h0 = (h0 ^ w0) * 0xFF51AFD7ED558CCDull; h0 ^= h0 >> 32;
+        h1 = (h1 ^ w1) * 0xFF51AFD7ED558CCDull; h1 ^= h1 >> 32;
+        h2 = (h2 ^ w2) * 0xFF51AFD7ED558CCDull; h2 ^= h2 >> 32;
+        h3 = (h3 ^ w3) * 0xFF51AFD7ED558CCDull; h3 ^= h3 >> 32;
+    }
+    h = h0 ^ (h1 * 0x9E3779B97F4A7C15ull) ^ (h2 * 0xC2B2AE3D27D4EB4Full)
+          ^ (h3 * 0x165667B19E3779F9ull);
+    for (; i + 8 <= n; i += 8) {
         uint64_t w;
         memcpy(&w, p + i, 8);
         h = (h ^ w) * 0xFF51AFD7ED558CCDull;
@@ -1862,7 +1893,9 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
  *   RECOMP_GPU_PRESENT=0   keep the GDI window (old behaviour)
  *   RECOMP_VSYNC=0         present without waiting for vblank (default 1)
  *   RECOMP_GPU_READBACK=0  skip copying the frame back to guest memory while
- *                          presenting directly (no latest.bmp / shots then) */
+ *                          presenting directly (no latest.bmp / shots then);
+ *                          1 = copy at once (waits for the GPU every flip);
+ *                          2 = a flip or two late, no waiting (default) */
 static const char k_present_hlsl[] =
     "Texture2D t : register(t0); SamplerState s : register(s0);\n"
     "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
@@ -1989,7 +2022,7 @@ static int p_init(void)
     e = getenv("RECOMP_VSYNC");
     P.vsync = e ? atoi(e) : 1;
     e = getenv("RECOMP_GPU_READBACK");
-    P.readback = e ? atoi(e) : 1;
+    P.readback = e ? atoi(e) : 2;
     return g_blit_init();
 }
 
@@ -2212,13 +2245,99 @@ static void g_rt_dump(GRt *rt)
     }
 }
 
+/* Copy a finished read-back slot into guest memory. With
+ * D3D11_MAP_FLAG_DO_NOT_WAIT returns 0 while the GPU is still on it. */
+static int rb_finish(GRb *s, UINT flags)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    HRESULT hr;
+    GRt *rt;
+    uint8_t *dst;
+    uint32_t y, x, w = s->cw, h = s->ch, pitch = s->pitch, bpp = s->bpp;
+
+    hr = ID3D11DeviceContext_Map(G.ctx, (ID3D11Resource *)s->tex, 0, D3D11_MAP_READ,
+                                 flags, &m);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+        return 0;
+    s->pending = 0;
+    if (FAILED(hr))
+        return 1;
+    if (nv2a_backend_surface_ok(s->va, pitch * h)) {
+        dst = (uint8_t *)nv2a_backend_guest(s->va);
+        for (y = 0; y < h; y++) {
+            const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
+            uint8_t *row = dst + (size_t)y * pitch;
+            if (bpp == 4) {
+                memcpy(row, src, (size_t)w * 4);
+            } else {
+                uint16_t *o = (uint16_t *)row;
+                for (x = 0; x < w; x++) {
+                    const uint8_t *p = src + x * 4;
+                    o[x] = (uint16_t)(((p[2] >> 3) << 11) | ((p[1] >> 2) << 5) | (p[0] >> 3));
+                }
+            }
+        }
+    }
+    {
+        /* RECOMP_GPU_SHOT_DIR (+ _EVERY, default 60): the presented target
+         * as drawn, every n frames, at most 100 files. RECOMP_GPU_SHOT_FROM
+         * = seconds after the first resolve before shots start. */
+        static const char *dir = (const char *)-1;
+        static int every, shots;
+        static ULONGLONG shot_from, shot_ms;
+        if (dir == (const char *)-1) {
+            const char *e = getenv("RECOMP_GPU_SHOT_EVERY");
+            const char *fr = getenv("RECOMP_GPU_SHOT_FROM");
+            const char *ms = getenv("RECOMP_GPU_SHOT_EVERY_MS");
+            dir = getenv("RECOMP_GPU_SHOT_DIR");
+            every = e ? atoi(e) : 60;
+            if (every < 1) every = 1;
+            /* RECOMP_GPU_SHOT_EVERY_MS: by wall time instead of frames (menus
+             * run >1000 FPS, so a frame interval burns the 100-shot cap). */
+            shot_ms = ms ? (ULONGLONG)atoi(ms) : 0;
+            if (shot_ms) every = 1;
+            shot_from = GetTickCount64() + (fr ? (ULONGLONG)(atof(fr) * 1000.0) : 0);
+        }
+        if (dir && shots < 100 && s->frame % (uint32_t)every == 0 &&
+            GetTickCount64() >= shot_from) {
+            if (shot_ms) shot_from = GetTickCount64() + shot_ms;
+            char path[512];
+            FILE *f;
+            snprintf(path, sizeof path, "%s/shot-%05u.bmp", dir, s->frame);
+            if ((f = fopen(path, "wb")) != NULL) {
+                uint8_t hd[54];
+                uint32_t sz = 54 + s->w * s->h * 4;
+                int32_t neg_h = -(int32_t)s->h;
+                memset(hd, 0, sizeof hd);
+                hd[0] = 'B'; hd[1] = 'M';
+                memcpy(hd + 2, &sz, 4);
+                hd[10] = 54; hd[14] = 40;
+                memcpy(hd + 18, &s->w, 4);
+                memcpy(hd + 22, &neg_h, 4);
+                hd[26] = 1; hd[28] = 32;
+                fwrite(hd, 1, 54, f);
+                for (y = 0; y < s->h; y++)
+                    fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, 4, s->w, f);
+                fclose(f);
+                shots++;
+            }
+        }
+    }
+    ID3D11DeviceContext_Unmap(G.ctx, (ID3D11Resource *)s->tex, 0);
+    /* What the guest now holds of this target, for the CPU-overwrite check
+     * in g_tex_srv. */
+    rt = g_rt_find(s->va);
+    if (rt && rt->pitch == pitch)
+        rt->guest_fp = g_rt_fp(rt);
+    return 1;
+}
+
 static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
 {
     LARGE_INTEGER t0;
     GRt *rt = g_rt_find(va);
-    D3D11_MAPPED_SUBRESOURCE m;
-    uint8_t *dst;
-    uint32_t y, x, w, h;
+    GRb *s;
+    uint32_t w, h;
 
     if (!rt || !pitch || (bpp != 2 && bpp != 4))
         return;
@@ -2240,9 +2359,13 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
         g_time_end(&t0);
         return;
     }
-    if (!G.staging || G.staging_w != rt->w || G.staging_h != rt->h) {
+    s = &G.rb[G.rb_next];
+    if (s->pending)
+        rb_finish(s, 0);                /* ring full: the oldest lands now */
+    if (!s->tex || s->w != rt->w || s->h != rt->h) {
         D3D11_TEXTURE2D_DESC td;
-        REL(G.staging);
+        REL(s->tex);
+        s->w = s->h = 0;
         memset(&td, 0, sizeof td);
         td.Width = rt->w;
         td.Height = rt->h;
@@ -2251,12 +2374,12 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_STAGING;
         td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        if (FAILED(ID3D11Device_CreateTexture2D(G.dev, &td, NULL, &G.staging))) {
+        if (FAILED(ID3D11Device_CreateTexture2D(G.dev, &td, NULL, &s->tex))) {
             g_time_end(&t0);
             return;
         }
-        G.staging_w = rt->w;
-        G.staging_h = rt->h;
+        s->w = rt->w;
+        s->h = rt->h;
     }
     if (G.scale > 1 || rt->ew != rt->w) {
         /* Back to guest size first (linear filter averages the scaled
@@ -2287,79 +2410,31 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
         }
         /* A widened target gives the guest its centred part. */
         g_blit(rt->srv, G.down_rtv, -rt->ox, 0.0f, (float)rt->ew, (float)rt->h, 1);
-        ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)G.staging,
+        ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s->tex,
                                          (ID3D11Resource *)G.down_tex);
     } else {
-        ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)G.staging,
+        ID3D11DeviceContext_CopyResource(G.ctx, (ID3D11Resource *)s->tex,
                                          (ID3D11Resource *)rt->tex);
     }
-    if (FAILED(ID3D11DeviceContext_Map(G.ctx, (ID3D11Resource *)G.staging, 0,
-                                       D3D11_MAP_READ, 0, &m))) {
-        g_time_end(&t0);
-        return;
-    }
-    dst = (uint8_t *)nv2a_backend_guest(va);
-    for (y = 0; y < h; y++) {
-        const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
-        uint8_t *row = dst + (size_t)y * pitch;
-        if (bpp == 4) {
-            memcpy(row, src, (size_t)w * 4);
-        } else {
-            uint16_t *o = (uint16_t *)row;
-            for (x = 0; x < w; x++) {
-                const uint8_t *p = src + x * 4;
-                o[x] = (uint16_t)(((p[2] >> 3) << 11) | ((p[1] >> 2) << 5) | (p[0] >> 3));
-            }
+    s->pending = 1;
+    s->va = va;
+    s->pitch = pitch;
+    s->bpp = bpp;
+    s->cw = w;
+    s->ch = h;
+    s->frame = G.frame;
+    G.rb_next = (G.rb_next + 1) % G_RB_N;
+    if (P.readback == 1) {
+        rb_finish(s, 0);
+    } else {
+        /* Land what the GPU has finished, oldest first. */
+        uint32_t k;
+        for (k = 0; k < G_RB_N; k++) {
+            GRb *o = &G.rb[(G.rb_next + k) % G_RB_N];
+            if (o->pending && !rb_finish(o, D3D11_MAP_FLAG_DO_NOT_WAIT))
+                break;
         }
     }
-    {
-        /* RECOMP_GPU_SHOT_DIR (+ _EVERY, default 60): the presented target
-         * as drawn, every n frames, at most 100 files. RECOMP_GPU_SHOT_FROM
-         * = seconds after the first resolve before shots start. */
-        static const char *dir = (const char *)-1;
-        static int every, shots;
-        static ULONGLONG shot_from, shot_ms;
-        if (dir == (const char *)-1) {
-            const char *e = getenv("RECOMP_GPU_SHOT_EVERY");
-            const char *fr = getenv("RECOMP_GPU_SHOT_FROM");
-            const char *ms = getenv("RECOMP_GPU_SHOT_EVERY_MS");
-            dir = getenv("RECOMP_GPU_SHOT_DIR");
-            every = e ? atoi(e) : 60;
-            if (every < 1) every = 1;
-            /* RECOMP_GPU_SHOT_EVERY_MS: by wall time instead of frames (menus
-             * run >1000 FPS, so a frame interval burns the 100-shot cap). */
-            shot_ms = ms ? (ULONGLONG)atoi(ms) : 0;
-            if (shot_ms) every = 1;
-            shot_from = GetTickCount64() + (fr ? (ULONGLONG)(atof(fr) * 1000.0) : 0);
-        }
-        if (dir && shots < 100 && G.frame % (uint32_t)every == 0 &&
-            GetTickCount64() >= shot_from) {
-            if (shot_ms) shot_from = GetTickCount64() + shot_ms;
-            char path[512];
-            FILE *f;
-            snprintf(path, sizeof path, "%s/shot-%05u.bmp", dir, G.frame);
-            if ((f = fopen(path, "wb")) != NULL) {
-                uint8_t hd[54];
-                uint32_t sz = 54 + rt->w * rt->h * 4;
-                int32_t neg_h = -(int32_t)rt->h;
-                memset(hd, 0, sizeof hd);
-                hd[0] = 'B'; hd[1] = 'M';
-                memcpy(hd + 2, &sz, 4);
-                hd[10] = 54; hd[14] = 40;
-                memcpy(hd + 18, &rt->w, 4);
-                memcpy(hd + 22, &neg_h, 4);
-                hd[26] = 1; hd[28] = 32;
-                fwrite(hd, 1, 54, f);
-                for (y = 0; y < rt->h; y++)
-                    fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, 4, rt->w, f);
-                fclose(f);
-                shots++;
-            }
-        }
-    }
-    ID3D11DeviceContext_Unmap(G.ctx, (ID3D11Resource *)G.staging, 0);
-    if (rt->pitch == pitch)
-        rt->guest_fp = g_rt_fp(rt);
     G.n_resolves++;
     g_time_end(&t0);
 }
