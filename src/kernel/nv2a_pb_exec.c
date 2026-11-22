@@ -3450,8 +3450,12 @@ static int vsh_par_init(void)
         int n, i;
         tried = 1;
         GetSystemInfo(&si);
-        n = e ? atoi(e) : (int)si.dwNumberOfProcessors / 2;
-        if (n > 8) n = 8;
+        n = (int)si.dwNumberOfProcessors / 2;
+        if (n > 8) n = 8;                 /* the default; ask for more by name */
+        if (e) {
+            n = atoi(e);
+            if (n > 32) n = 32;
+        }
         if (n >= 1) {
             s_vp.go = CreateSemaphoreA(NULL, 0, 64, NULL);
             s_vp.done = CreateEventA(NULL, FALSE, FALSE, NULL);

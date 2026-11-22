@@ -731,6 +731,16 @@ static int wheel_pulse(int dir, LONG steps)
 /* Autofire for a real pad: the same "autofire" buttons, held on the
  * controller, are pressed and released at autofire_rate. Only the pad's own
  * state goes through here (before keyboard and mouse merge in). */
+static volatile LONG s_pad_last_use;     /* GetTickCount of the last real-pad input */
+static volatile LONG s_pad_used;
+
+DWORD mkb_pad_idle_ms(void)
+{
+    if (!s_pad_used)
+        return 0xFFFFFFFFu;
+    return GetTickCount() - (DWORD)s_pad_last_use;
+}
+
 void mkb_autofire_pad(XBOX_INPUT_STATE *pState)
 {
     static unsigned char was[MKB_T_STICK];
@@ -740,6 +750,20 @@ void mkb_autofire_pad(XBOX_INPUT_STATE *pState)
 
     if (!pState || !mkb_enabled())
         return;
+    /* Note when the controller is in use, so the mouse layer can keep its
+     * hands off (mouse aim turning a player who plays on the pad). */
+    {
+        const XBOX_GAMEPAD *g = &pState->Gamepad;
+        int i, use = (g->wButtons & 0xFF) != 0
+            || abs(g->sThumbLX) > 8000 || abs(g->sThumbLY) > 8000
+            || abs(g->sThumbRX) > 8000 || abs(g->sThumbRY) > 8000;
+        for (i = 0; i < 8 && !use; i++)
+            use = g->bAnalogButtons[i] > 30;
+        if (use) {
+            InterlockedExchange(&s_pad_last_use, (LONG)GetTickCount());
+            InterlockedExchange(&s_pad_used, 1);
+        }
+    }
     period = (DWORD)(1000.0 / s_autofire_rate);
     now = GetTickCount();
     for (t = 0; t < MKB_T_STICK; t++) {

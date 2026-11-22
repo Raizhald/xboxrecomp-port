@@ -55,6 +55,10 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
  * buttons, while held, are pressed and released at autofire_rate. */
 void mkb_autofire_pad(XBOX_INPUT_STATE *pState);
 
+/* Milliseconds since a real controller was last used (any button, trigger
+ * or stick past a deadzone); 0xFFFFFFFF when it never was. */
+DWORD mkb_pad_idle_ms(void);
+
 /*
  * mouse = cursor: the pointer stays visible and free, and every poll tells
  * the title where it is -- for a title (or its port) that turns the player
