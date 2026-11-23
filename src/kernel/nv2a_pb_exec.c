@@ -3341,6 +3341,8 @@ static int batch_uses_program(void)
     return (s_gpu.xf_mode & 3) == 2 && !no_vsh;
 }
 
+static void xf_post(Nv2aVshOutput *out);
+
 static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 {
     float in[NV2A_VSH_INPUTS][4];
@@ -3352,6 +3354,88 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
         fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
     if (!nv2a_vsh_run((const float (*)[4])in, out))
         return 0;
+    xf_post(out);
+    return 1;
+}
+
+/* RECOMP_VSH_BATCH=0: one vertex at a time, as before nv2a_vsh_run_batch.
+ * RECOMP_VSH_VERIFY=1: every batch is run again vertex by vertex and the
+ * outputs compared bit for bit; mismatches are counted and the first few
+ * printed. */
+static int vsh_batch_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VSH_BATCH");
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
+static void vsh_verify(int n, const float in[][NV2A_VSH_INPUTS][4],
+                       const Nv2aVshOutput *got)
+{
+    static int on = -1;
+    static volatile LONG batches, bad, shown;
+    int l;
+    if (on < 0)
+        on = getenv("RECOMP_VSH_VERIFY") != NULL;
+    if (!on)
+        return;
+    for (l = 0; l < n; l++) {
+        Nv2aVshOutput want;
+        if (!nv2a_vsh_run(in[l], &want))
+            continue;
+        if (memcmp(&want, &got[l], sizeof want) != 0) {
+            InterlockedIncrement(&bad);
+            if (InterlockedIncrement(&shown) <= 5) {
+                fprintf(stderr, "[VSHB] mismatch lane %d: pos %.9g %.9g %.9g %.9g vs %.9g %.9g %.9g %.9g\n",
+                        l, want.pos[0], want.pos[1], want.pos[2], want.pos[3],
+                        got[l].pos[0], got[l].pos[1], got[l].pos[2], got[l].pos[3]);
+                fflush(stderr);
+            }
+        }
+    }
+    if (InterlockedIncrement(&batches) % 20000 == 0) {
+        fprintf(stderr, "[VSHB] verified %ld batches, %ld vertices differ\n",
+                (long)batches, (long)bad);
+        fflush(stderr);
+    }
+}
+
+/* Transform the listed batch positions into s_xf, NV2A_VSH_BATCH at a time.
+ * 0: no program to run. */
+static int transform_list(const uint32_t *list, uint32_t m)
+{
+    float in[NV2A_VSH_BATCH][NV2A_VSH_INPUTS][4];
+    Nv2aVshOutput out[NV2A_VSH_BATCH];
+    uint32_t k, j, a;
+
+    if (!vsh_batch_on() || !batch_uses_program() || nv2a_vsh_cxt_write_enabled()) {
+        for (k = 0; k < m; k++)
+            if (!transform_vertex(s_gpu.idx[list[k]], &s_xf[list[k]]))
+                return 0;
+        return 1;
+    }
+    for (k = 0; k < m; k += NV2A_VSH_BATCH) {
+        uint32_t n = m - k < NV2A_VSH_BATCH ? m - k : NV2A_VSH_BATCH;
+        for (j = 0; j < n; j++)
+            for (a = 0; a < NV2A_VSH_INPUTS; a++)
+                fetch_attr(&s_gpu.attr[a], s_gpu.idx[list[k + j]], in[j][a]);
+        if (!nv2a_vsh_run_batch((int)n, (const float (*)[NV2A_VSH_INPUTS][4])in, out))
+            return 0;
+        vsh_verify((int)n, (const float (*)[NV2A_VSH_INPUTS][4])in, out);
+        for (j = 0; j < n; j++) {
+            xf_post(&out[j]);
+            s_xf[list[k + j]] = out[j];
+        }
+    }
+    return 1;
+}
+
+/* What the executor does to every program output after the run. */
+static void xf_post(Nv2aVshOutput *out)
+{
     /* oPos.w == 0 comes from a program that never divided by w: x, y and z
      * are already surface units. The hardware draws such a vertex (xemu
      * clamps w away from zero, in front of the eye), but raster_xf_clipped
@@ -3363,7 +3447,6 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
      * (anti-aliasing). */
     out->pos[0] *= s_gpu.aa_sx;
     out->pos[1] *= s_gpu.aa_sy;
-    return 1;
 }
 
 static void xf_set_viewport(void)
@@ -3421,11 +3504,8 @@ static void vsh_par_work(void)
         e = k + 64;
         if ((uint32_t)e > s_vp.total)
             e = (LONG)s_vp.total;
-        for (; k < e; k++) {
-            uint32_t i = s_vp.list[k];
-            if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
-                InterlockedExchange(&s_vp.failed, 1);
-        }
+        if (!transform_list(&s_vp.list[k], (uint32_t)(e - k)))
+            InterlockedExchange(&s_vp.failed, 1);
     }
 }
 
@@ -3503,7 +3583,9 @@ static void raster_batch_program(void)
         memset(s_vcache, 0, sizeof s_vcache);
         s_vcache_gen = 1;
     }
-    if (cache && n >= VSH_PAR_MIN && batch_uses_program() && vsh_par_init()) {
+    if (cache && batch_uses_program()
+        && ((n >= VSH_PAR_MIN && vsh_par_init()) || vsh_batch_on())) {
+        int pool = n >= VSH_PAR_MIN && vsh_par_init();
         static uint32_t *list, *src;
         uint32_t m = 0;
         if (!list) {
@@ -3525,10 +3607,13 @@ static void raster_batch_program(void)
                 s_vcache[slot].gen = s_vcache_gen;
             }
             s_vcache_runs += m;
-            /* The first one here: it decodes the program's slots. */
+            /* The first one here: it decodes the program's slots (also done
+             * by nv2a_vsh_prepare before the pool reads them). */
             if (m && !transform_vertex(s_gpu.idx[list[0]], &s_xf[list[0]]))
                 return;
-            if (m > 1 && !vsh_par_run(list + 1, m - 1))
+            nv2a_vsh_prepare();
+            if (m > 1 && !(pool ? vsh_par_run(list + 1, m - 1)
+                                : transform_list(list + 1, m - 1)))
                 return;
             for (i = 0; i < n; i++)
                 if (src[i] != i)

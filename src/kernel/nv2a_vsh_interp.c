@@ -575,3 +575,225 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
     }
     return 0;
 }
+
+/* ---- Batched interpreter (nv2a_vsh_run_batch) ---------------------------
+ * Registers as component x lane arrays. Every loop below is over lanes and
+ * does exactly what nv2a_vsh_run does for one vertex, in the same order, so
+ * each lane's floats come out bit for bit the same (/fp:precise, no FMA
+ * contraction). */
+#define VB NV2A_VSH_BATCH
+typedef struct { float v[4][VB]; } vec4b;
+
+static void read_src_b(const VshIns *d, int which, int n,
+                       const float in[][NV2A_VSH_INPUTS][4],
+                       const vec4b *temp, const vec4b *opos, const int *a0,
+                       vec4b *r)
+{
+    const VshSrc *x = &d->src[which];
+    int c, l;
+
+    if (x->mux == 1) {
+        const vec4b *s = (x->reg == 12) ? opos : (x->reg < 12 ? &temp[x->reg] : &temp[0]);
+        for (c = 0; c < 4; c++)
+            for (l = 0; l < VB; l++)
+                r->v[c][l] = s->v[x->sw[c]][l];
+    } else if (x->mux == 2) {
+        memset(r, 0, sizeof *r);
+        for (l = 0; l < n; l++)
+            for (c = 0; c < 4; c++)
+                r->v[c][l] = in[l][d->input][x->sw[c]];
+    } else if (!d->a0rel) {
+        int ci = (int)d->cidx;
+        const float *s;
+        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
+            ci = 0;
+        s = s_const[ci];
+        for (c = 0; c < 4; c++) {
+            float f = s[x->sw[c]];
+            for (l = 0; l < VB; l++)
+                r->v[c][l] = f;
+        }
+    } else {
+        memset(r, 0, sizeof *r);
+        for (l = 0; l < n; l++) {
+            int ci = (int)d->cidx + a0[l];
+            const float *s;
+            if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
+                ci = 0;
+            s = s_const[ci];
+            for (c = 0; c < 4; c++)
+                r->v[c][l] = s[x->sw[c]];
+        }
+    }
+    if (x->neg)
+        for (c = 0; c < 4; c++)
+            for (l = 0; l < VB; l++)
+                r->v[c][l] = -r->v[c][l];
+}
+
+static void write_masked_b(vec4b *dst, const vec4b *src, uint32_t mask)
+{
+    if (mask & 8) memcpy(dst->v[0], src->v[0], sizeof dst->v[0]);
+    if (mask & 4) memcpy(dst->v[1], src->v[1], sizeof dst->v[1]);
+    if (mask & 2) memcpy(dst->v[2], src->v[2], sizeof dst->v[2]);
+    if (mask & 1) memcpy(dst->v[3], src->v[3], sizeof dst->v[3]);
+}
+
+static void run_mac_b(uint32_t op, const vec4b *a, const vec4b *b, const vec4b *c,
+                      int *a0, int n, vec4b *r)
+{
+    int i, l;
+
+    *r = *a;
+    switch (op) {
+    case 1: break;                                            /* mov */
+    case 2: for (i = 0; i < 4; i++) for (l = 0; l < VB; l++)
+                r->v[i][l] = a->v[i][l] * b->v[i][l];
+            break;
+    case 3: for (i = 0; i < 4; i++) for (l = 0; l < VB; l++)
+                r->v[i][l] = a->v[i][l] + c->v[i][l];
+            break;
+    case 4: for (i = 0; i < 4; i++) for (l = 0; l < VB; l++)
+                r->v[i][l] = a->v[i][l] * b->v[i][l] + c->v[i][l];
+            break;
+    case 5: for (l = 0; l < VB; l++) {
+                float s = a->v[0][l]*b->v[0][l] + a->v[1][l]*b->v[1][l] + a->v[2][l]*b->v[2][l];
+                r->v[0][l] = r->v[1][l] = r->v[2][l] = r->v[3][l] = s;
+            }
+            break;
+    case 6: for (l = 0; l < VB; l++) {                        /* dph */
+                float s = a->v[0][l]*b->v[0][l] + a->v[1][l]*b->v[1][l] + a->v[2][l]*b->v[2][l]
+                          + b->v[3][l];
+                r->v[0][l] = r->v[1][l] = r->v[2][l] = r->v[3][l] = s;
+            }
+            break;
+    case 7: for (l = 0; l < VB; l++) {
+                float s = a->v[0][l]*b->v[0][l] + a->v[1][l]*b->v[1][l] + a->v[2][l]*b->v[2][l]
+                          + a->v[3][l]*b->v[3][l];
+                r->v[0][l] = r->v[1][l] = r->v[2][l] = r->v[3][l] = s;
+            }
+            break;
+    case 8: for (l = 0; l < VB; l++) {                        /* dst */
+                r->v[0][l] = 1.0f; r->v[1][l] = a->v[1][l] * b->v[1][l];
+                r->v[2][l] = a->v[2][l]; r->v[3][l] = b->v[3][l];
+            }
+            break;
+    case 9: for (i = 0; i < 4; i++) for (l = 0; l < VB; l++)
+                r->v[i][l] = a->v[i][l] < b->v[i][l] ? a->v[i][l] : b->v[i][l];
+            break;
+    case 10: for (i = 0; i < 4; i++) for (l = 0; l < VB; l++)
+                r->v[i][l] = a->v[i][l] >= b->v[i][l] ? a->v[i][l] : b->v[i][l];
+            break;
+    case 11: for (i = 0; i < 4; i++) for (l = 0; l < VB; l++)
+                r->v[i][l] = a->v[i][l] < b->v[i][l] ? 1.0f : 0.0f;
+            break;
+    case 12: for (i = 0; i < 4; i++) for (l = 0; l < VB; l++)
+                r->v[i][l] = a->v[i][l] >= b->v[i][l] ? 1.0f : 0.0f;
+            break;
+    case 13: for (l = 0; l < n; l++)                          /* arl */
+                a0[l] = (int)floorf(a->v[0][l] + 0.001f);
+            break;
+    default: break;
+    }
+}
+
+void nv2a_vsh_prepare(void)
+{
+    uint32_t s;
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        if (!s_dec_ok[s])
+            decode_slot(s);
+        if (s_dec[s].final)
+            break;
+    }
+}
+
+int nv2a_vsh_run_batch(int n, const float in[][NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+{
+    vec4b temp[12], opos, outregs[13];
+    int a0[VB];
+    uint32_t s;
+    int l, c;
+
+    if (n <= 0)
+        return 1;
+    if (n > VB)
+        n = VB;
+    if (s_cxt_write) {                       /* serial by nature */
+        for (l = 0; l < n; l++)
+            if (!nv2a_vsh_run(in[l], &out[l]))
+                return 0;
+        return 1;
+    }
+    memset(temp, 0, sizeof temp);
+    memset(&opos, 0, sizeof opos);
+    memset(outregs, 0, sizeof outregs);
+    memset(a0, 0, sizeof a0);
+    for (l = 0; l < VB; l++) {               /* defaults as in nv2a_vsh_run */
+        outregs[3].v[3][l] = outregs[4].v[3][l] = 1.0f;
+        outregs[9].v[3][l] = outregs[10].v[3][l] = 1.0f;
+        outregs[11].v[3][l] = outregs[12].v[3][l] = 1.0f;
+    }
+
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const VshIns *ins;
+        vec4b a, b, cc, mres, ires;
+        if (!s_dec_ok[s])
+            decode_slot(s);
+        ins = &s_dec[s];
+        if (ins->need & 1) read_src_b(ins, 0, n, in, temp, &opos, a0, &a);
+        else memset(&a, 0, sizeof a);
+        if (ins->need & 2) read_src_b(ins, 1, n, in, temp, &opos, a0, &b);
+        else memset(&b, 0, sizeof b);
+        if (ins->need & 4) read_src_b(ins, 2, n, in, temp, &opos, a0, &cc);
+        else memset(&cc, 0, sizeof cc);
+        memset(&mres, 0, sizeof mres);
+        memset(&ires, 0, sizeof ires);
+
+        if (ins->mac)
+            run_mac_b(ins->mac, &a, &b, &cc, a0, n, &mres);
+        if (ins->ilu) {
+            for (l = 0; l < n; l++) {        /* the scalar code, per lane */
+                vec4 cv, rv;
+                for (c = 0; c < 4; c++)
+                    cv.v[c] = cc.v[c][l];
+                rv = run_ilu(ins->ilu, cv);
+                for (c = 0; c < 4; c++)
+                    ires.v[c][l] = rv.v[c];
+            }
+        }
+        if (ins->mac && ins->mac != 13 && ins->mac_mask) {
+            vec4b *d = ins->tdst == 12 ? &opos : (ins->tdst < 12 ? &temp[ins->tdst] : NULL);
+            if (d) write_masked_b(d, &mres, ins->mac_mask);
+        }
+        if (ins->ilu && ins->ilu_mask) {
+            uint32_t it = ins->mac ? 1u : ins->tdst;
+            vec4b *d = it == 12 ? &opos : (it < 12 ? &temp[it] : NULL);
+            if (d) write_masked_b(d, &ires, ins->ilu_mask);
+        }
+        if (ins->omask && ins->out_o) {      /* c[] writes: cxt_write only */
+            const vec4b *src = ins->out_ilu ? &ires : &mres;
+            if (ins->oaddr == 0)
+                write_masked_b(&opos, src, ins->omask);
+            else if (ins->oaddr < 13)
+                write_masked_b(&outregs[ins->oaddr], src, ins->omask);
+        }
+        if (ins->final) {
+            for (l = 0; l < n; l++) {
+                Nv2aVshOutput *o = &out[l];
+                for (c = 0; c < 4; c++) {
+                    o->pos[c] = opos.v[c][l];
+                    o->d0[c] = outregs[3].v[c][l];
+                    o->d1[c] = outregs[4].v[c][l];
+                    o->fog[c] = outregs[5].v[c][l];
+                    o->tex[0][c] = outregs[9].v[c][l];
+                    o->tex[1][c] = outregs[10].v[c][l];
+                    o->tex[2][c] = outregs[11].v[c][l];
+                    o->tex[3][c] = outregs[12].v[c][l];
+                }
+            }
+            return 1;
+        }
+    }
+    return 0;
+}

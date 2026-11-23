@@ -53,6 +53,21 @@ int nv2a_vsh_cxt_write_enabled(void);
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
 
+/* The same for up to NV2A_VSH_BATCH vertices at once: each instruction is
+ * decoded, its constants fetched and its operation dispatched once for the
+ * lot, and the per-vertex arithmetic runs over arrays the compiler turns
+ * into SIMD. Results are bit-identical to nv2a_vsh_run (same operations in
+ * the same order; the ILU ops call the same scalar code). A program that
+ * may write c[] (CXT_WRITE_EN) runs vertex by vertex through nv2a_vsh_run,
+ * since a vertex can then depend on the ones before it. Returns 0 as
+ * nv2a_vsh_run does. Lanes past n are not touched. */
+#define NV2A_VSH_BATCH 8
+int  nv2a_vsh_run_batch(int n, const float in[][NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+
+/* Decode the program from the start slot now, so that several threads can
+ * then run it (decoding is otherwise lazy, on the first vertex). */
+void nv2a_vsh_prepare(void);
+
 /* Diagnostics: whether the program from the start slot indexes constants
  * by a0 (skinning), and the whole program state -- start slot, program
  * memory, constants -- for an offline re-run. */
