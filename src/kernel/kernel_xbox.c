@@ -127,6 +127,70 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  *   - DVD Region: Region 1 (North America)
  * ============================================================================ */
 
+/* The EEPROM user section (XBOX_USER_SETTINGS, 0x60 bytes) as one blob:
+ * XQueryValue(XC_MAX_OS) asks for all of it, and XAPI's GetLocalTime builds
+ * its TIME_ZONE_INFORMATION from it (Fallout: Brotherhood of Steel,
+ * sub_00091084: bias at +4, names +8/+0xC, dates +0x18/+0x1C, biases
+ * +0x28/+0x2C, "no daylight time" = bit 1 of MiscFlags at +0x58). It used
+ * to come back all zeros -- daylight time on with month-0 transition dates,
+ * which no console reports -- and that call sat in the loop of a player's
+ * one hang right after an autosave. The time zone is the host's
+ * (host_timezone.c); the rest matches the single-value answers below. */
+#define XBOX_USER_SETTINGS_SIZE 0x60
+extern void xbox_host_timezone(int32_t *bias, char std_name[4], char dlt_name[4],
+                               uint8_t std_date[4], uint8_t dlt_date[4],
+                               int32_t *std_bias, int32_t *dlt_bias, int *use_dst);
+
+static ULONG video_flags(void)
+{
+    /* NTSC with widescreen and HDTV support enabled.
+     * RECOMP_VIDEO_WIDESCREEN=0 reports a 4:3 set instead. */
+    const char *ws = getenv("RECOMP_VIDEO_WIDESCREEN");
+    return (ws && atoi(ws) == 0 ? 0 : XC_VIDEO_FLAGS_WIDESCREEN) | XC_VIDEO_FLAGS_HDTV;
+}
+
+static void user_settings(uint8_t s[XBOX_USER_SETTINGS_SIZE])
+{
+    static uint8_t cache[XBOX_USER_SETTINGS_SIZE];
+    static int have;
+    if (!have) {
+        int32_t bias, sb, db;
+        int dst;
+        uint32_t v;
+        memset(cache, 0, sizeof cache);
+        xbox_host_timezone(&bias, (char *)cache + 0x08, (char *)cache + 0x0C,
+                           cache + 0x18, cache + 0x1C, &sb, &db, &dst);
+        memcpy(cache + 0x04, &bias, 4);
+        memcpy(cache + 0x28, &sb, 4);
+        memcpy(cache + 0x2C, &db, 4);
+        v = 1;                    memcpy(cache + 0x30, &v, 4);   /* English */
+        v = (uint32_t)video_flags(); memcpy(cache + 0x34, &v, 4);
+        /* 0x38 audio (stereo), 0x3C-0x44 parental: unrestricted, 0x48-0x54
+         * online addresses: none -- all zero. */
+        v = dst ? 0 : 2;          memcpy(cache + 0x58, &v, 4);   /* MiscFlags */
+        v = 1;                    memcpy(cache + 0x5C, &v, 4);   /* DVD region 1 */
+        fprintf(stderr, "  [KERNEL] EEPROM time zone: bias %d min, std %d, dlt %d, "
+                        "daylight %s (%u/%u/%u %u:00 -> %u/%u/%u %u:00)\n",
+                (int)bias, (int)sb, (int)db, dst ? "on" : "off",
+                cache[0x1C], cache[0x1D], cache[0x1E], cache[0x1F],
+                cache[0x18], cache[0x19], cache[0x1A], cache[0x1B]);
+        fflush(stderr);
+        have = 1;
+    }
+    memcpy(s, cache, XBOX_USER_SETTINGS_SIZE);
+}
+
+/* One DWORD-sized field of the blob for a single-value query. */
+static void answer(const uint8_t *src, ULONG n, PULONG Type, PVOID Value,
+                   ULONG ValueLength, PULONG ResultLength, ULONG type)
+{
+    if (ValueLength >= n) {
+        memcpy(Value, src, n);
+        if (Type) *Type = type;
+        if (ResultLength) *ResultLength = n;
+    }
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
@@ -135,6 +199,30 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
         "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
+
+    {
+        uint8_t us[XBOX_USER_SETTINGS_SIZE];
+        user_settings(us);
+        switch (ValueIndex) {
+        case XC_MAX_OS: {                   /* the whole user section */
+            ULONG n = ValueLength < sizeof us ? ValueLength : (ULONG)sizeof us;
+            memset(Value, 0, ValueLength);
+            memcpy(Value, us, n);
+            if (Type) *Type = 3;            /* REG_BINARY */
+            if (ResultLength) *ResultLength = n;
+            return STATUS_SUCCESS;
+        }
+        case XC_TIMEZONE_BIAS: answer(us + 0x04, 4, Type, Value, ValueLength, ResultLength, 4); return STATUS_SUCCESS;
+        case XC_TZ_STD_NAME:   answer(us + 0x08, 4, Type, Value, ValueLength, ResultLength, 3); return STATUS_SUCCESS;
+        case XC_TZ_DLT_NAME:   answer(us + 0x0C, 4, Type, Value, ValueLength, ResultLength, 3); return STATUS_SUCCESS;
+        case XC_TZ_STD_DATE:   answer(us + 0x18, 4, Type, Value, ValueLength, ResultLength, 3); return STATUS_SUCCESS;
+        case XC_TZ_DLT_DATE:   answer(us + 0x1C, 4, Type, Value, ValueLength, ResultLength, 3); return STATUS_SUCCESS;
+        case XC_TZ_STD_BIAS:   answer(us + 0x28, 4, Type, Value, ValueLength, ResultLength, 4); return STATUS_SUCCESS;
+        case XC_TZ_DLT_BIAS:   answer(us + 0x2C, 4, Type, Value, ValueLength, ResultLength, 4); return STATUS_SUCCESS;
+        case XC_MISC:          answer(us + 0x58, 4, Type, Value, ValueLength, ResultLength, 4); return STATUS_SUCCESS;
+        default: break;
+        }
+    }
 
     switch (ValueIndex) {
     case XC_LANGUAGE:
@@ -150,10 +238,8 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         /* NTSC with widescreen and HDTV support enabled.
          * RECOMP_VIDEO_WIDESCREEN=0 reports a 4:3 set instead. */
         if (ValueLength >= sizeof(ULONG)) {
-            const char *ws = getenv("RECOMP_VIDEO_WIDESCREEN");
             static int logged;
-            *(PULONG)Value = (ws && atoi(ws) == 0 ? 0 : XC_VIDEO_FLAGS_WIDESCREEN)
-                             | XC_VIDEO_FLAGS_HDTV;
+            *(PULONG)Value = video_flags();
             if (!logged++) {
                 fprintf(stderr, "  [KERNEL] video settings queried: 0x%08lX\n",
                         (unsigned long)*(PULONG)Value);

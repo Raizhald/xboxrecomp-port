@@ -15,6 +15,7 @@ set(KERNEL_SOURCES
     kernel_sync.c
     kernel_hal.c
     kernel_xbox.c
+    host_timezone.c
     kernel_ob.c
     kernel_io.c
     kernel_crypto.c
