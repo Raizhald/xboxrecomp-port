@@ -341,6 +341,7 @@ typedef struct {
     uint32_t w, h;                      /* staging size */
     int pending;
     uint32_t va, pitch, bpp, cw, ch, frame;
+    uint64_t mem_fp;                    /* guest memory there at the flip */
 } GRb;
 
 static struct {
@@ -2262,7 +2263,25 @@ static int rb_finish(GRb *s, UINT flags)
     s->pending = 0;
     if (FAILED(hr))
         return 1;
-    if (nv2a_backend_surface_ok(s->va, pitch * h)) {
+    /* The copy lands a flip or two late. Titles draw their frames on the GPU
+     * and never write this memory themselves, so if it changed since the
+     * flip the surface was freed and the memory reused -- during a level
+     * load, for a pushbuffer -- and writing the old frame there would
+     * corrupt it (a fault in nv2a_pb_scan_segment loading the bar). Then the
+     * frame is dropped; so it is when the target itself is gone. */
+    rt = g_rt_find(s->va);
+    if (!rt || !nv2a_backend_surface_ok(s->va, pitch * h)
+        || g_hash(nv2a_backend_guest(s->va), pitch * h, 0) != s->mem_fp) {
+        static int logged;
+        if (logged++ < 5) {
+            fprintf(stderr, "[GPUB] read-back of %08X dropped: the memory %s since the flip\n",
+                    s->va, rt ? "changed" : "is no render target");
+            fflush(stderr);
+        }
+        ID3D11DeviceContext_Unmap(G.ctx, (ID3D11Resource *)s->tex, 0);
+        return 1;
+    }
+    {
         dst = (uint8_t *)nv2a_backend_guest(s->va);
         for (y = 0; y < h; y++) {
             const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
@@ -2326,9 +2345,19 @@ static int rb_finish(GRb *s, UINT flags)
     ID3D11DeviceContext_Unmap(G.ctx, (ID3D11Resource *)s->tex, 0);
     /* What the guest now holds of this target, for the CPU-overwrite check
      * in g_tex_srv. */
-    rt = g_rt_find(s->va);
-    if (rt && rt->pitch == pitch)
+    if (rt->pitch == pitch)
         rt->guest_fp = g_rt_fp(rt);
+    /* This write changed the memory: copies still pending for the same
+     * place expect what is there now, not what was there at their flip. */
+    {
+        uint64_t now = g_hash(nv2a_backend_guest(s->va), pitch * h, 0);
+        uint32_t k;
+        for (k = 0; k < G_RB_N; k++) {
+            GRb *o = &G.rb[k];
+            if (o != s && o->pending && o->va == s->va && o->pitch == pitch && o->ch == h)
+                o->mem_fp = now;
+        }
+    }
     return 1;
 }
 
@@ -2423,6 +2452,7 @@ static void gb_resolve(uint32_t va, uint32_t pitch, uint32_t bpp)
     s->cw = w;
     s->ch = h;
     s->frame = G.frame;
+    s->mem_fp = g_hash(nv2a_backend_guest(va), pitch * h, 0);
     G.rb_next = (G.rb_next + 1) % G_RB_N;
     if (P.readback == 1) {
         rb_finish(s, 0);
